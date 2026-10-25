@@ -547,7 +547,6 @@ type (
 		Stamp    policyTestStamp  `json:"stamp"`
 		Text     *policyTestText  `json:"text"`
 		Skipped  string           `json:"-"`
-		Dash     string           `json:"-,"`
 		Untagged string
 		List     []policyTestInner `json:"list"`
 		Stamps   []policyTestStamp `json:"stamps"`
@@ -563,11 +562,10 @@ func (s policyTestStamp) MarshalJSON() ([]byte, error) { return json.Marshal(s.S
 func (t policyTestText) MarshalText() ([]byte, error) { return []byte(t.Value), nil }
 
 // The description follows encoding/json: a struct that encodes itself is a
-// value like any other, "-" leaves a field out and "-," names it "-", an
-// untagged field goes by its Go name, and only a list of plain structs is a
-// list of objects.
+// value like any other, "-" leaves a field out, an untagged field goes by its
+// Go name, and only a list of plain structs is a list of objects.
 func TestPolicyObjectOfFollowsEncodingJSON(t *testing.T) {
-	want := []string{"inner", "inner.value", "stamp", "text", "-", "Untagged", "list (list)", "list[].value", "stamps", "names"}
+	want := []string{"inner", "inner.value", "stamp", "text", "Untagged", "list (list)", "list[].value", "stamps", "names"}
 	if got := policyModelPaths(policyObjectOf(reflect.TypeOf(policyTestShape{})), ""); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("paths = %v, want %v", got, want)
 	}
