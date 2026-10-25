@@ -1245,19 +1245,21 @@ func (h *protocolHarness) actionValue(t *testing.T, typeName string, attrs map[s
 }
 
 // listServer and actionServer are the protocol server with the RPCs that
-// tfprotov6 still keeps out of ProviderServer.
-func (h *protocolHarness) listServer(t *testing.T) tfprotov6.ProviderServerWithListResource {
+// tfprotov6 still keeps out of ProviderServer. They assert the narrow
+// ListResourceServer and ActionServer interfaces rather than the combined
+// ProviderServerWith* ones, which tfprotov6 has deprecated.
+func (h *protocolHarness) listServer(t *testing.T) tfprotov6.ListResourceServer {
 	t.Helper()
-	server, ok := h.server.(tfprotov6.ProviderServerWithListResource)
+	server, ok := h.server.(tfprotov6.ListResourceServer)
 	if !ok {
 		t.Fatal("the protocol server does not serve list resources")
 	}
 	return server
 }
 
-func (h *protocolHarness) actionServer(t *testing.T) tfprotov6.ProviderServerWithActions {
+func (h *protocolHarness) actionServer(t *testing.T) tfprotov6.ActionServer {
 	t.Helper()
-	server, ok := h.server.(tfprotov6.ProviderServerWithActions)
+	server, ok := h.server.(tfprotov6.ActionServer)
 	if !ok {
 		t.Fatal("the protocol server does not serve actions")
 	}

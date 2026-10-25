@@ -248,11 +248,7 @@ func (a *snapshotNowAction) addStartError(ctx context.Context, source kopiaclien
 // refused to snapshot it, and says why that was, or returns "" when the
 // lookup fails.
 func (a *snapshotNowAction) diagnoseMissingSource(ctx context.Context, source kopiaclient.SourceInfo) string {
-	sources, err := a.client.ListSources(ctx, kopiaclient.SourcesFilter{
-		Host:     source.Host,
-		UserName: source.UserName,
-		Path:     source.Path,
-	})
+	sources, err := a.client.ListSources(ctx, kopiaclient.SourcesFilter(source))
 	if err != nil {
 		tflog.Debug(ctx, "Could not look the snapshot source up", map[string]any{"target": source.String(), "error": err.Error()})
 		return ""

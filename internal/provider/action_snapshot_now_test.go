@@ -307,9 +307,7 @@ func testAccCheckSourceSnapshotted(target string) acc.TestCheckFunc {
 		}
 		deadline := time.Now().Add(2 * time.Minute)
 		for {
-			resp, err := c.ListSources(context.Background(), kopiaclient.SourcesFilter{
-				Host: source.Host, UserName: source.UserName, Path: source.Path,
-			})
+			resp, err := c.ListSources(context.Background(), kopiaclient.SourcesFilter(source))
 			if err != nil {
 				return fmt.Errorf("listing the sources of %s: %w", target, err)
 			}
