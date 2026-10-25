@@ -9,9 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/action"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	datasourceschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	fwprovider "github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
@@ -90,6 +92,7 @@ import (
 //	resp := modifyResourcePlan(t, r, config, plan, prior) // resource.ModifyPlanResponse
 //	diags := validateResourceConfig(t, r, config)         // ValidateConfig and ConfigValidators
 //	resp := readDataSource(t, d, config)                  // datasource.ReadResponse
+//	resp := invokeActionDirectly(t, a, attrs)             // action.InvokeResponse, without validation
 //
 // Responses start out the way the framework initialises them (Create: null
 // state; Read, Update and Delete: the prior state; ModifyPlan: the plan;
@@ -129,6 +132,19 @@ import (
 // requireProtocolWarningContaining, and decode with h.decodeResource,
 // h.decodeDataSource and h.identityValue. Configurations for these are built
 // with h.resourceValue and h.dataSourceValue, from the served schema.
+//
+// List resources and actions are only reached through the protocol server:
+//
+//	results := h.list(t, "kopia_policy", h.listValue(t, "kopia_policy", attrs), includeResource, limit)
+//	diags := listDiagnostics(results)                  // every result's diagnostics together
+//	diags = h.validateList(t, "kopia_policy", config)
+//	progress, diags := h.invokeAction(t, "kopia_snapshot_now", h.actionValue(t, "kopia_snapshot_now", attrs))
+//	diags = h.validateAction(t, "kopia_snapshot_now", config)
+//
+// withListResources and withActions register other ones than provider.go's;
+// a harness built withResources lists nothing unless it says which list
+// resources to serve, because the framework refuses a list resource whose
+// resource is not registered.
 //
 // # Diagnostics
 //
@@ -668,6 +684,22 @@ func readDataSource(t *testing.T, d datasource.DataSource, config tftypes.Value)
 	return resp
 }
 
+// invokeActionDirectly runs a.Invoke with attrs as its configuration, which
+// skips the validation the protocol server would run first: the way to reach
+// what Invoke checks of a value that was unknown at validation time. Progress
+// messages are dropped; h.invokeAction collects them.
+func invokeActionDirectly(t *testing.T, a action.Action, attrs map[string]any) action.InvokeResponse {
+	t.Helper()
+	ctx := context.Background()
+	var schemaResp action.SchemaResponse
+	a.Schema(ctx, action.SchemaRequest{}, &schemaResp)
+	requireNoErrors(t, schemaResp.Diagnostics)
+	config := tfsdk.Config{Schema: schemaResp.Schema, Raw: tfValue(t, schemaResp.Schema.Type().TerraformType(ctx), attrs)}
+	var resp action.InvokeResponse
+	a.Invoke(ctx, action.InvokeRequest{Config: config}, &resp)
+	return resp
+}
+
 // --- diagnostics ------------------------------------------------------------
 
 func requireNoErrors(t *testing.T, diags diag.Diagnostics) {
@@ -742,9 +774,11 @@ func requireAttributeDiagnostic(t *testing.T, diags diag.Diagnostics, attributeP
 // one Configure would build, and optionally its own registrations.
 type harnessProvider struct {
 	kopiaProvider
-	client      *kopiaclient.Client
-	resources   []func() resource.Resource
-	dataSources []func() datasource.DataSource
+	client        *kopiaclient.Client
+	resources     []func() resource.Resource
+	dataSources   []func() datasource.DataSource
+	listResources []func() list.ListResource
+	actions       []func() action.Action
 }
 
 func (p *harnessProvider) Configure(_ context.Context, _ fwprovider.ConfigureRequest, resp *fwprovider.ConfigureResponse) {
@@ -769,6 +803,24 @@ func (p *harnessProvider) DataSources(ctx context.Context) []func() datasource.D
 	return p.kopiaProvider.DataSources(ctx)
 }
 
+// ListResources registers provider.go's list resources only alongside
+// provider.go's resources: the framework refuses a list resource whose
+// resource is not registered, so a harness with its own resources lists
+// nothing unless withListResources says otherwise.
+func (p *harnessProvider) ListResources(ctx context.Context) []func() list.ListResource {
+	if p.listResources != nil || p.resources != nil {
+		return p.listResources
+	}
+	return p.kopiaProvider.ListResources(ctx)
+}
+
+func (p *harnessProvider) Actions(ctx context.Context) []func() action.Action {
+	if p.actions != nil {
+		return p.actions
+	}
+	return p.kopiaProvider.Actions(ctx)
+}
+
 // harnessOption changes what newProtocolHarness registers.
 type harnessOption func(*harnessProvider)
 
@@ -781,6 +833,23 @@ func withResources(constructors ...func() resource.Resource) harnessOption {
 // provider.go's.
 func withDataSources(constructors ...func() datasource.DataSource) harnessOption {
 	return func(p *harnessProvider) { p.dataSources = constructors }
+}
+
+// withListResources registers exactly these list resources instead of
+// provider.go's. Each needs its resource registered too.
+func withListResources(constructors ...func() list.ListResource) harnessOption {
+	return func(p *harnessProvider) { p.listResources = constructors }
+}
+
+// withActions registers exactly these actions instead of provider.go's.
+func withActions(constructors ...func() action.Action) harnessOption {
+	return func(p *harnessProvider) { p.actions = constructors }
+}
+
+// withClient configures the provider with c instead of a plain client of the
+// fake, such as one whose requests time out.
+func withClient(c *kopiaclient.Client) harnessOption {
+	return func(p *harnessProvider) { p.client = c }
 }
 
 // protocolHarness is a configured protocol server plus the schemas it serves.
@@ -1142,6 +1211,144 @@ func (h *protocolHarness) readDataSource(t *testing.T, typeName string, config t
 	resp := h.readDataSourceResponse(t, typeName, config)
 	requireNoProtocolErrors(t, resp.Diagnostics)
 	return h.decodeDataSource(t, typeName, resp.State)
+}
+
+// listResourceSchema is the served schema of a list block's configuration.
+func (h *protocolHarness) listResourceSchema(t *testing.T, typeName string) *tfprotov6.Schema {
+	t.Helper()
+	s, ok := h.schemas.ListResourceSchemas[typeName]
+	if !ok {
+		t.Fatalf("no list resource %s is registered; registered: %s", typeName, strings.Join(harnessSortedKeys(h.schemas.ListResourceSchemas), ", "))
+	}
+	return s
+}
+
+// actionSchema is the served schema of an action.
+func (h *protocolHarness) actionSchema(t *testing.T, typeName string) *tfprotov6.Schema {
+	t.Helper()
+	s, ok := h.schemas.ActionSchemas[typeName]
+	if !ok {
+		t.Fatalf("no action %s is registered; registered: %s", typeName, strings.Join(harnessSortedKeys(h.schemas.ActionSchemas), ", "))
+	}
+	return s.Schema
+}
+
+// listValue and actionValue build configurations of the served schemas.
+func (h *protocolHarness) listValue(t *testing.T, typeName string, attrs map[string]any) tftypes.Value {
+	t.Helper()
+	return tfValue(t, h.listResourceSchema(t, typeName).ValueType(), attrs)
+}
+
+func (h *protocolHarness) actionValue(t *testing.T, typeName string, attrs map[string]any) tftypes.Value {
+	t.Helper()
+	return tfValue(t, h.actionSchema(t, typeName).ValueType(), attrs)
+}
+
+// listServer and actionServer are the protocol server with the RPCs that
+// tfprotov6 still keeps out of ProviderServer.
+func (h *protocolHarness) listServer(t *testing.T) tfprotov6.ProviderServerWithListResource {
+	t.Helper()
+	server, ok := h.server.(tfprotov6.ProviderServerWithListResource)
+	if !ok {
+		t.Fatal("the protocol server does not serve list resources")
+	}
+	return server
+}
+
+func (h *protocolHarness) actionServer(t *testing.T) tfprotov6.ProviderServerWithActions {
+	t.Helper()
+	server, ok := h.server.(tfprotov6.ProviderServerWithActions)
+	if !ok {
+		t.Fatal("the protocol server does not serve actions")
+	}
+	return server
+}
+
+// validateList runs ValidateListResourceConfig: the list block's attribute
+// validators.
+func (h *protocolHarness) validateList(t *testing.T, typeName string, config tftypes.Value) []*tfprotov6.Diagnostic {
+	t.Helper()
+	resp, err := h.listServer(t).ValidateListResourceConfig(context.Background(), &tfprotov6.ValidateListResourceConfigRequest{
+		TypeName: typeName,
+		Config:   dynamicValue(t, config),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.Diagnostics
+}
+
+// list runs ListResource the way `terraform query` does and collects every
+// result the stream yields. A limit of 0 sets none; Terraform always sends
+// one, 100 unless the list block sets another.
+func (h *protocolHarness) list(t *testing.T, typeName string, config tftypes.Value, includeResource bool, limit int64) []tfprotov6.ListResourceResult {
+	t.Helper()
+	stream, err := h.listServer(t).ListResource(context.Background(), &tfprotov6.ListResourceRequest{
+		TypeName:        typeName,
+		Config:          dynamicValue(t, config),
+		IncludeResource: includeResource,
+		Limit:           limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []tfprotov6.ListResourceResult
+	for result := range stream.Results {
+		results = append(results, result)
+	}
+	return results
+}
+
+// listDiagnostics gathers the diagnostics of every list result.
+func listDiagnostics(results []tfprotov6.ListResourceResult) []*tfprotov6.Diagnostic {
+	var diags []*tfprotov6.Diagnostic
+	for _, r := range results {
+		diags = append(diags, r.Diagnostics...)
+	}
+	return diags
+}
+
+// validateAction runs ValidateActionConfig: the action's attribute validators,
+// then its config validators.
+func (h *protocolHarness) validateAction(t *testing.T, typeName string, config tftypes.Value) []*tfprotov6.Diagnostic {
+	t.Helper()
+	resp, err := h.actionServer(t).ValidateActionConfig(context.Background(), &tfprotov6.ValidateActionConfigRequest{
+		ActionType: typeName,
+		Config:     dynamicValue(t, config),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.Diagnostics
+}
+
+// invokeAction runs InvokeAction and returns the progress messages the action
+// sent, in order, and the diagnostics it completed with.
+func (h *protocolHarness) invokeAction(t *testing.T, typeName string, config tftypes.Value) ([]string, []*tfprotov6.Diagnostic) {
+	t.Helper()
+	stream, err := h.actionServer(t).InvokeAction(context.Background(), &tfprotov6.InvokeActionRequest{
+		ActionType: typeName,
+		Config:     dynamicValue(t, config),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress []string
+	var diags []*tfprotov6.Diagnostic
+	completed := false
+	for event := range stream.Events {
+		switch e := event.Type.(type) {
+		case tfprotov6.ProgressInvokeActionEventType:
+			progress = append(progress, e.Message)
+		case tfprotov6.CompletedInvokeActionEventType:
+			diags = e.Diagnostics
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatal("the action's event stream ended without a completed event")
+	}
+	return progress, diags
 }
 
 // proposedNewState builds the proposed new state Terraform core sends with

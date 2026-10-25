@@ -3,7 +3,9 @@
 Manages the configuration of a running [Kopia](https://kopia.io) server —
 snapshot policies, notification profiles, throttling and the repository
 description — as code, in Terraform and OpenTofu, through the HTTP API behind
-the server's web UI.
+the server's web UI. With Terraform 1.14 it also finds existing policies and
+profiles for `terraform query`, and offers actions that send a test
+notification or take a snapshot now.
 
 ## Versions
 
@@ -16,7 +18,8 @@ reports another release.
 | 0.1.0 | Unreleased | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
 
 Terraform 1.9 is enough for everything except importing by resource identity,
-which needs Terraform 1.12 or newer.
+which needs Terraform 1.12 or newer, and the list resources and actions, which
+need Terraform 1.14 or newer.
 
 Changes between releases are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -34,9 +37,10 @@ left out: the storage credentials would end up in Terraform state, creating a
 repository is a one-off, and destroying one could only disconnect it. Connect
 the server to its repository before `kopia server start`. Snapshots are left
 out too, as data rather than configuration; the `kopia_snapshots` and
-`kopia_sources` data sources read them.
+`kopia_sources` data sources read them, and the `kopia_snapshot_now` action
+asks the server for one.
 
-## Resources and data sources
+## Resources, data sources, list resources and actions
 
 | Resource | Lifecycle | Notes |
 | --- | --- | --- |
@@ -56,13 +60,67 @@ out too, as data rather than configuration; the `kopia_snapshots` and
 | `kopia_sources` | The snapshot sources the server knows, with status, effective schedule, next snapshot time and last snapshot |
 | `kopia_snapshots` | The snapshots of one host, optionally of one user and path, with retention reasons and pins |
 
-### Import by identity
+| List resource | Purpose |
+| --- | --- |
+| `kopia_policy` | The targets that have a policy, filtered by host, user and path, for `terraform query`; each target once, and without the malformed targets other clients can store, with a warning naming them |
+| `kopia_notification_profile` | The email, Pushover and webhook profiles, for `terraform query`; with `include_resource`, every profile is read in full, secrets included |
+
+| Action | Purpose |
+| --- | --- |
+| `kopia_notification_test` | Has Kopia send its test notification through a stored profile, by name; errors come with the profile's secrets redacted |
+| `kopia_snapshot_now` | Asks the server for a snapshot of one source, `user@host:path`, now. Kopia only queues it, so the action does not wait for it |
+
+### Import by identity and `terraform query`
 
 `kopia_policy` and `kopia_notification_profile` carry a resource identity —
 `target` and `name` — so an `import` block can name them with `identity`
 instead of an import id (Terraform 1.12+). Older Terraform releases keep
 importing by id. The two singletons have no identity; their import ids are
 fixed.
+
+The same two can be listed in a `.tfquery.hcl` file (Terraform 1.14+):
+`terraform query` shows the policies and profiles the server has, and
+`terraform query -generate-config-out=generated.tf` writes an `import` block and
+a resource block for each one. With `include_resource = true` the generated
+blocks hold every setting, as importing and refreshing would record it.
+
+```hcl
+list "kopia_policy" "docker_host1" {
+  provider         = kopia
+  include_resource = true
+
+  config {
+    host      = "host1"
+    user_name = "docker"
+  }
+}
+```
+
+### Actions
+
+Actions (Terraform 1.14+) keep no state. They run when a resource's
+`lifecycle { action_trigger { ... } }` fires, or on demand with
+`terraform apply -invoke=action.<type>.<name>`:
+
+```hcl
+resource "kopia_policy" "app" {
+  target = "root@kopia1:/data/app"
+
+  # Take the first snapshot as soon as the server knows the path.
+  lifecycle {
+    action_trigger {
+      events  = [after_create]
+      actions = [action.kopia_snapshot_now.app]
+    }
+  }
+}
+
+action "kopia_snapshot_now" "app" {
+  config {
+    target = kopia_policy.app.target
+  }
+}
+```
 
 ### Requirements on the Kopia server
 
@@ -154,6 +212,15 @@ These follow from Kopia's API, not from the provider's design.
   `kopia_repository_description` leaves it in place.
 * **The Kopia version comes from the title of the web UI page.** A build that
   reports none triggers no warning about an untested release.
+* **`kopia_snapshot_now` does not wait for the snapshot.** Kopia queues it and
+  reports neither a task nor the outcome; `kopia_sources` shows how it went.
+  The server snapshots only the sources it knows (those with a snapshot or a
+  path policy of their own) on its own host, and none on a read-only
+  repository connection; Kopia reads a missing host, user or path as "any",
+  so the action takes exactly one `user@host:path`.
+* **The test notification ignores `min_severity`.** Kopia sends it whatever the
+  profile's minimum severity, and every successful `kopia_notification_test`
+  delivers a real message.
 
 ## Usage
 
@@ -222,7 +289,8 @@ credentials, not the UI user's, so keep the two apart.
 
 ## Development
 
-Requires Go 1.26+, and Terraform 1.12+ and Docker for the acceptance tests.
+Requires Go 1.26+, and Terraform 1.12+ and Docker for the acceptance tests;
+those of the list resources and actions skip themselves below Terraform 1.14.
 
 ```shell
 make build          # build the provider binary

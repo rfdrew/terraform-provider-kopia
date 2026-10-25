@@ -701,3 +701,27 @@ func TestHarnessAttributeDiagnostics(t *testing.T) {
 	requireWarningContaining(t, diags, "Odd retention")
 	requireNoErrorContaining(t, diags, "Odd")
 }
+
+// A harness with resources of its own serves no list resources unless told
+// which, because the framework refuses a list resource whose resource is not
+// registered; it serves provider.go's actions unless told otherwise.
+func TestHarnessListResourceAndActionRegistrations(t *testing.T) {
+	fake := newFakeKopia()
+
+	h := newProtocolHarness(t, fake, withResources(NewPolicyResource))
+	if got := harnessSortedKeys(h.schemas.ListResourceSchemas); len(got) != 0 {
+		t.Errorf("list resources = %v, want none", got)
+	}
+	if got := strings.Join(harnessSortedKeys(h.schemas.ActionSchemas), ","); got != "kopia_notification_test,kopia_snapshot_now" {
+		t.Errorf("actions = %s, want provider.go's", got)
+	}
+
+	h = newProtocolHarness(t, fake, withResources(NewPolicyResource), withListResources(NewPolicyListResource),
+		withActions(NewSnapshotNowAction))
+	if got := strings.Join(harnessSortedKeys(h.schemas.ListResourceSchemas), ","); got != "kopia_policy" {
+		t.Errorf("list resources = %s, want kopia_policy", got)
+	}
+	if got := strings.Join(harnessSortedKeys(h.schemas.ActionSchemas), ","); got != "kopia_snapshot_now" {
+		t.Errorf("actions = %s, want kopia_snapshot_now", got)
+	}
+}

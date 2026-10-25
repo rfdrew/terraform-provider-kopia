@@ -286,8 +286,9 @@ func TestSnapshotsDataSourceReportsErrors(t *testing.T) {
 // --- acceptance --------------------------------------------------------------
 
 // TestAccSnapshotsDataSource lists the snapshots of the test server's own
-// host, both deduplicated and in full. The test server takes no snapshots of
-// its own, so only the shape of the answer is checked.
+// host, both deduplicated and in full. The test server takes a snapshot only
+// when TestAccSnapshotNowAction asks for one, which may or may not have run
+// before, so only the shape of the answer is checked.
 func TestAccSnapshotsDataSource(t *testing.T) {
 	host := os.Getenv(envAccSourceHost)
 	if host == "" {

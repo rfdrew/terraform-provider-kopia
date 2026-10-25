@@ -11,9 +11,10 @@ import (
 
 // These tests look at the provider the way Terraform does, through the
 // protocol server of New: what GetProviderSchema and friends serve for every
-// registered resource and data source. The framework validates each schema
-// only when it serves it, so a mistake in one that no other test registers
-// would otherwise surface first in a user's `terraform init`.
+// registered resource, data source, list resource and action. The framework
+// validates each schema only when it serves it, so a mistake in one that no
+// other test registers would otherwise surface first in a user's `terraform
+// init`.
 
 // providerTestServer is the protocol server of the provider the binary runs.
 func providerTestServer(t *testing.T) tfprotov6.ProviderServer {
@@ -25,8 +26,10 @@ func providerTestServer(t *testing.T) tfprotov6.ProviderServer {
 	return server
 }
 
-// Every resource and data source is registered, and the framework accepts
-// every schema: GetProviderSchema runs ValidateImplementation on each one.
+// Every resource, data source, list resource and action is registered, and
+// the framework accepts every schema: GetProviderSchema runs
+// ValidateImplementation on each one, and refuses a list resource without a
+// resource of the same type name.
 func TestProviderServesEveryResourceAndDataSource(t *testing.T) {
 	ctx := context.Background()
 	server := providerTestServer(t)
@@ -59,15 +62,32 @@ func TestProviderServesEveryResourceAndDataSource(t *testing.T) {
 	if got := harnessSortedKeys(resp.DataSourceSchemas); !reflect.DeepEqual(got, wantDataSources) {
 		t.Errorf("data sources = %v, want %v", got, wantDataSources)
 	}
+	// Only resources with an identity can be listed.
+	wantListResources := []string{
+		"kopia_notification_profile",
+		"kopia_policy",
+	}
+	if got := harnessSortedKeys(resp.ListResourceSchemas); !reflect.DeepEqual(got, wantListResources) {
+		t.Errorf("list resources = %v, want %v", got, wantListResources)
+	}
+	wantActions := []string{
+		"kopia_notification_test",
+		"kopia_snapshot_now",
+	}
+	if got := harnessSortedKeys(resp.ActionSchemas); !reflect.DeepEqual(got, wantActions) {
+		t.Errorf("actions = %v, want %v", got, wantActions)
+	}
 
 	metadata, err := server.GetMetadata(ctx, &tfprotov6.GetMetadataRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireNoProtocolErrors(t, metadata.Diagnostics)
-	if len(metadata.Resources) != len(wantResources) || len(metadata.DataSources) != len(wantDataSources) {
-		t.Errorf("GetMetadata lists %d resources and %d data sources, want %d and %d",
-			len(metadata.Resources), len(metadata.DataSources), len(wantResources), len(wantDataSources))
+	if len(metadata.Resources) != len(wantResources) || len(metadata.DataSources) != len(wantDataSources) ||
+		len(metadata.ListResources) != len(wantListResources) || len(metadata.Actions) != len(wantActions) {
+		t.Errorf("GetMetadata lists %d resources, %d data sources, %d list resources and %d actions, want %d, %d, %d and %d",
+			len(metadata.Resources), len(metadata.DataSources), len(metadata.ListResources), len(metadata.Actions),
+			len(wantResources), len(wantDataSources), len(wantListResources), len(wantActions))
 	}
 }
 
@@ -120,6 +140,12 @@ func TestProviderSchemasDescribeEveryAttribute(t *testing.T) {
 	}
 	for typeName, s := range resp.DataSourceSchemas {
 		check("data source", typeName, s)
+	}
+	for typeName, s := range resp.ListResourceSchemas {
+		check("list resource", typeName, s)
+	}
+	for typeName, s := range resp.ActionSchemas {
+		check("action", typeName, s.Schema)
 	}
 }
 

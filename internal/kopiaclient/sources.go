@@ -3,6 +3,7 @@ package kopiaclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"time"
@@ -196,6 +197,66 @@ func (c *Client) ListSources(ctx context.Context, filter SourcesFilter) (*Source
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// ErrIncompleteSnapshotSource is returned by StartSnapshot for a source
+// without a host, a user name or a path, before anything is sent.
+var ErrIncompleteSnapshotSource = errors.New("starting a snapshot needs a source with a host, a user name and a " +
+	"path: kopia matches an empty one against every source, and would start a snapshot of each")
+
+// StartSnapshot asks the server to take a snapshot of source now, through
+// POST /api/v1/sources/upload, the call behind the Kopia UI's "Snapshot now"
+// button. It returns the sources Kopia queued a snapshot of, by their string
+// form, each with whether Kopia reported success.
+//
+// Kopia only queues the request: the handler hands it to the source's
+// manager (sourceManager.upload, then scheduleSnapshotNow,
+// internal/server/source_manager.go:241-259), which runs the snapshot in the
+// background once a slot is free, and answers at once, without a task id. The
+// manager takes a request off its queue as soon as it is free, before the
+// snapshot waits for a slot, and the queue holds one more
+// (source_manager.go:185-212, 602): a request made while a snapshot is
+// pending or running queues another after it, and only one made while that
+// one still waits is merged with it. A source paused through the server's
+// control API drops the request (source_manager.go:190-195).
+//
+// The handler matches the host, userName and path parameters exactly, and an
+// empty or missing one matches every source (sourceMatchesURLFilter,
+// internal/server/api_snapshots.go:235-249), so a source without all three is
+// refused here with ErrIncompleteSnapshotSource. Kopia skips the sources it
+// does not snapshot itself — those of another host, and every source when
+// its connection to the repository is read-only — and when nothing is left
+// it answers 404 NOT_FOUND "no source matching the provided filters"
+// (api_snapshots.go:172-194), which IsNotFound reports. It also knows only the
+// sources that have a snapshot or a path policy of their own, or that were
+// added in the Kopia UI.
+func (c *Client) StartSnapshot(ctx context.Context, source SourceInfo) (map[string]bool, error) {
+	if source.Host == "" || source.UserName == "" || source.Path == "" {
+		return nil, fmt.Errorf("%w; got %q", ErrIncompleteSnapshotSource, source.String())
+	}
+
+	// Kopia reads the source from the query string alone and ignores any
+	// body. The user parameter is camelCase: "username" would be ignored,
+	// leaving the user unfiltered.
+	query := url.Values{"host": {source.Host}, "userName": {source.UserName}, "path": {source.Path}}
+	var resp struct {
+		Sources map[string]struct {
+			Success bool `json:"success"`
+		} `json:"sources"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/v1/sources/upload", query, nil, &resp); err != nil {
+		return nil, err
+	}
+	// Kopia answers 404 rather than an empty map when nothing matched, so an
+	// empty one is not a response this client understands.
+	if len(resp.Sources) == 0 {
+		return nil, fmt.Errorf("POST /api/v1/sources/upload for %s: kopia answered without naming a source it queued a snapshot of", source)
+	}
+	queued := make(map[string]bool, len(resp.Sources))
+	for name, result := range resp.Sources {
+		queued[name] = result.Success
+	}
+	return queued, nil
 }
 
 // SnapshotsResponse mirrors serverapi.SnapshotsResponse

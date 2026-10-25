@@ -609,9 +609,15 @@ func (r *notificationProfileResource) Read(ctx context.Context, req resource.Rea
 
 	state.fromProfile(name, profile)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	addNotificationProfileStoredWarnings(&resp.Diagnostics, name, profile.Warnings)
+}
 
-	for _, warning := range profile.Warnings {
-		resp.Diagnostics.AddWarning(
+// addNotificationProfileStoredWarnings reports the stored options of a profile
+// that Kopia itself cannot use, as a read finds them: the warnings of a
+// NotificationProfile read from Kopia.
+func addNotificationProfileStoredWarnings(diags *diag.Diagnostics, name string, warnings []string) {
+	for _, warning := range warnings {
+		diags.AddWarning(
 			"Kopia cannot use notification profile as stored",
 			fmt.Sprintf("Notification profile %q was saved by another client in a form Kopia cannot use. %s "+
 				"Any change made through Terraform saves the profile again, and so does `terraform apply "+
@@ -720,10 +726,8 @@ func (r *notificationProfileResource) sendTest(ctx context.Context, profile kopi
 	var detail strings.Builder
 	fmt.Fprintf(&detail, "Kopia saved notification profile %q, but could not deliver its test notification: %s",
 		profile.Name, notificationProfileErrorText(err, profile))
-	var netErr net.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-		detail.WriteString("\n\nThe provider stopped waiting at its request_timeout, but Kopia carries on " +
-			"delivering, so the outcome is unknown and the message may still arrive.")
+	if requestTimedOut(err) {
+		detail.WriteString("\n\n" + notificationTestTimeoutNote)
 	}
 	if created {
 		detail.WriteString("\n\nThe profile is recorded in state but marked tainted, so the next apply replaces " +
@@ -733,4 +737,19 @@ func (r *notificationProfileResource) sendTest(ctx context.Context, profile kopi
 			"if it changes again.")
 	}
 	diags.AddAttributeError(path.Root(profile.MethodType()), "Kopia could not send the test notification", detail.String())
+}
+
+// notificationTestTimeoutNote explains a test notification that outlasted the
+// provider's request_timeout.
+const notificationTestTimeoutNote = "The provider stopped waiting at its request_timeout, but Kopia carries on " +
+	"delivering, so the outcome is unknown and the message may still arrive."
+
+// requestTimedOut reports whether a request failed because the provider
+// stopped waiting for it at its request_timeout. Kopia serves a request on a
+// context the client cannot cancel, so it may have been served all the same:
+// a test notification delivered (spec: notification.md §5.5), a snapshot
+// queued.
+func requestTimedOut(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }

@@ -16,7 +16,7 @@ First release. Built and verified against Kopia 0.23.1.
   `--no-ui`), signed in to as the UI user (`--server-username` and
   `--server-password`), with a repository connected.
 - Terraform 1.9 or newer, or OpenTofu 1.9 or newer; import by resource identity
-  needs Terraform 1.12.
+  needs Terraform 1.12, and the list resources and actions Terraform 1.14.
 
 ### Added
 
@@ -76,6 +76,24 @@ First release. Built and verified against Kopia 0.23.1.
 - The `kopia_sources` and `kopia_snapshots` data sources: the snapshot sources
   the server knows, with their state and schedule, and the snapshots of one
   host with their retention reasons and pins.
+- The `kopia_policy` and `kopia_notification_profile` list resources, for
+  `terraform query`: the targets that have a policy, filtered by host, user
+  and path, and the email, Pushover and webhook profiles, each listed once
+  with its identity and, with `include_resource`, every attribute as an import
+  and refresh records it. Objects the resources cannot represent — malformed
+  targets other clients can store, profiles of another method — are left out
+  with a warning that names them.
+- The `kopia_notification_test` action, which has Kopia send its test
+  notification through a stored profile, named by `name`, and reports a
+  missing profile or a failed delivery with the profile's secrets redacted.
+- The `kopia_snapshot_now` action, which asks the server for a snapshot of one
+  source, `user@host:path`, as the Kopia UI's **Snapshot now** button does.
+  Kopia only queues the snapshot, so the action does not wait for it; it
+  refuses `(global)`, `@host` and `user@host`, which Kopia would read as every
+  matching source, and explains why a source the server does not know or does
+  not snapshot itself was refused. A request that outlasts `request_timeout`
+  is reported as having an unknown outcome, since Kopia may queue the snapshot
+  all the same.
 - The guide "Kopia server with kopia-docker-watcher", which splits the
   configuration between Terraform and the watcher and explains how container
   path policies inherit from Terraform's.

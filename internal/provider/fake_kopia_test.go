@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rfdrew/terraform-provider-kopia/internal/kopiaclient"
 )
@@ -221,6 +222,47 @@ func (f *fakeKopia) RoundTrip(req *http.Request) (*http.Response, error) {
 	rec := httptest.NewRecorder()
 	f.serve(rec, req)
 	return rec.Result(), nil
+}
+
+// lostAnswerKopia is the fake behind a connection that loses Kopia's answer
+// to one route: the fake serves the request, as Kopia still does once the
+// provider has given up on it, and the client gets the error of fail instead
+// of the response.
+type lostAnswerKopia struct {
+	*fakeKopia
+	route string
+	fail  func(*http.Request) error
+}
+
+func (l lostAnswerKopia) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := l.fakeKopia.RoundTrip(req)
+	if err != nil || req.Method+" "+req.URL.Path != l.route {
+		return resp, err
+	}
+	_ = resp.Body.Close()
+	return nil, l.fail(req)
+}
+
+// clientLosingAnswer returns a client of the fake, with the given request
+// timeout, that never sees Kopia's answer to route: it fails with fail's
+// error.
+func (f *fakeKopia) clientLosingAnswer(t *testing.T, route string, timeout time.Duration, fail func(*http.Request) error) *kopiaclient.Client {
+	t.Helper()
+	c, err := kopiaclient.New(kopiaclient.Options{
+		URL: fakeURL, Username: fakeUsername, Password: fakePassword, Timeout: timeout,
+		Transport: lostAnswerKopia{fakeKopia: f, route: route, fail: fail},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// awaitRequestTimeout is a fail for clientLosingAnswer: the answer never
+// comes, so the request ends when the client's timeout expires.
+func awaitRequestTimeout(req *http.Request) error {
+	<-req.Context().Done()
+	return req.Context().Err()
 }
 
 func (f *fakeKopia) serve(w http.ResponseWriter, req *http.Request) {
