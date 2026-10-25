@@ -519,14 +519,39 @@ var ErrPolicyUnavailable = errors.New("kopia answered with null instead of the p
 // Kopia answers 400 NOT_FOUND "policy not found", not 404
 // (internal/server/api_policies.go:59). A 200 null is ErrPolicyUnavailable.
 func (c *Client) GetPolicy(ctx context.Context, target SourceInfo) (*Policy, error) {
-	var policy *Policy
-	if err := c.do(ctx, http.MethodGet, "/api/v1/policy", target.query(), nil, &policy); err != nil {
+	stored, err := c.GetPolicyJSON(ctx, target)
+	if err != nil {
 		return nil, err
 	}
-	if policy == nil {
+	var policy Policy
+	if err := json.Unmarshal(stored, &policy); err != nil {
+		return nil, fmt.Errorf("decoding the policy of %s from GET /api/v1/policy: %w (body: %s)",
+			target, err, truncate(string(stored), 512))
+	}
+	return &policy, nil
+}
+
+// GetPolicyJSON returns the policy defined on exactly target as the JSON
+// object Kopia sent, with every field, including those Policy does not model,
+// which SetPolicyKeepingUnknown keeps. It fails as GetPolicy does.
+//
+// Kopia decodes a stored policy into its own types before it answers, so the
+// fields are those the server's release knows: one that a newer kopia
+// binary wrote straight to the repository is already gone, and lost on any
+// write through the server, the Kopia UI's included.
+func (c *Client) GetPolicyJSON(ctx context.Context, target SourceInfo) (json.RawMessage, error) {
+	var stored json.RawMessage
+	if err := c.do(ctx, http.MethodGet, "/api/v1/policy", target.query(), nil, &stored); err != nil {
+		return nil, err
+	}
+	if policyIsNull(stored) {
 		return nil, fmt.Errorf("GET /api/v1/policy for %s: %w", target, ErrPolicyUnavailable)
 	}
-	return policy, nil
+	if _, isObject, err := policyMembers(stored); err != nil || !isObject {
+		return nil, fmt.Errorf("GET /api/v1/policy for %s: expected a policy object but got %s",
+			target, truncate(string(stored), 512))
+	}
+	return stored, nil
 }
 
 // SetPolicy replaces the policy of target with policy, creating it when the
@@ -536,11 +561,41 @@ func (c *Client) GetPolicy(ctx context.Context, target SourceInfo) (*Policy, err
 // maxParallelSnapshots on a path and a path ending in a separator each fail
 // with 500 INTERNAL, told apart from storage failures only by the message
 // (spec: policy.md §2.2).
+//
+// Whatever the target stores that Policy does not model is lost; use
+// SetPolicyKeepingUnknown to keep it.
 func (c *Client) SetPolicy(ctx context.Context, target SourceInfo, policy *Policy) error {
 	if policy == nil {
 		policy = &Policy{}
 	}
 	return c.do(ctx, http.MethodPut, "/api/v1/policy", target.query(), policy, nil)
+}
+
+// SetPolicyKeepingUnknown is SetPolicy for a target that stores stored, as
+// GetPolicyJSON returned it just before, or nil when it has no policy. Every
+// field Policy models is written from policy, and removed where policy leaves
+// it out, while every other field of stored is kept, at any level:
+//
+//   - a section, or a field inside a section or a nested object, that Policy
+//     does not model is sent back as Kopia reported it, null, {}, false and 0
+//     included, as they mean to Kopia what they meant when it stored them;
+//   - an element of a list of objects, such as a time of day, keeps its
+//     unmodelled fields when policy has an element of the same value;
+//   - an action keeps its unmodelled fields when policy has an action that
+//     runs the same command; one policy leaves out, or that runs another
+//     command, goes with them, since they may belong to the old command, and
+//     on their own would leave an action without one.
+//
+// A stored key that matches a modelled one in another case is that field,
+// as Kopia decodes keys case-insensitively. Without unmodelled fields, the body
+// is exactly what SetPolicy sends. A write by someone else between reading
+// stored and this call is lost all the same, as Kopia has no version check.
+func (c *Client) SetPolicyKeepingUnknown(ctx context.Context, target SourceInfo, policy *Policy, stored json.RawMessage) error {
+	body, err := mergePolicyJSON(stored, policy)
+	if err != nil {
+		return fmt.Errorf("PUT /api/v1/policy for %s: merging the policy into the one stored: %w", target, err)
+	}
+	return c.do(ctx, http.MethodPut, "/api/v1/policy", target.query(), body, nil)
 }
 
 // DeletePolicy removes the policy of target. Kopia answers 200 whether or not
@@ -564,9 +619,13 @@ type PolicyFilter struct {
 // ID is the manifest id, which changes on every PUT, so it does not identify
 // a policy for long.
 type PolicyEntry struct {
-	ID     string     `json:"id"`
-	Target SourceInfo `json:"target"`
-	Policy *Policy    `json:"policy"`
+	ID     string
+	Target SourceInfo
+	// Policy is nil when Kopia sent none.
+	Policy *Policy
+	// PolicyJSON is the policy as Kopia sent it, with the fields Policy does
+	// not model; nil when Kopia sent none.
+	PolicyJSON json.RawMessage
 }
 
 // ListPolicies returns every stored policy that matches filter, oldest change
@@ -574,16 +633,39 @@ type PolicyEntry struct {
 // same target can leave duplicate manifests behind (spec: policy.md §3.3).
 func (c *Client) ListPolicies(ctx context.Context, filter PolicyFilter) ([]PolicyEntry, error) {
 	var resp struct {
-		Policies []PolicyEntry `json:"policies"`
+		Policies []struct {
+			ID     string          `json:"id"`
+			Target SourceInfo      `json:"target"`
+			Policy json.RawMessage `json:"policy"`
+		} `json:"policies"`
 	}
 	query := SourceInfo(filter).query()
 	if err := c.do(ctx, http.MethodGet, "/api/v1/policies", query, nil, &resp); err != nil {
 		return nil, err
 	}
-	if resp.Policies == nil {
-		return []PolicyEntry{}, nil
+
+	entries := make([]PolicyEntry, 0, len(resp.Policies))
+	for _, listed := range resp.Policies {
+		entry := PolicyEntry{ID: listed.ID, Target: listed.Target}
+		if len(listed.Policy) > 0 && !policyIsNull(listed.Policy) {
+			entry.Policy = &Policy{}
+			if err := json.Unmarshal(listed.Policy, entry.Policy); err != nil {
+				return nil, fmt.Errorf("decoding the policy of %s from GET /api/v1/policies: %w", listed.Target, err)
+			}
+			entry.PolicyJSON = listed.Policy
+		}
+		entries = append(entries, entry)
 	}
-	return resp.Policies, nil
+	return entries, nil
+}
+
+// CanonicalJSON returns the policy of e as compact JSON, as
+// SetPolicyKeepingUnknown would write it back unchanged: the fields Policy
+// models as Policy encodes them, so that empty sections are left out
+// whichever release answered, then every other field as Kopia sent it. A
+// missing policy is {}.
+func (e PolicyEntry) CanonicalJSON() (json.RawMessage, error) {
+	return mergePolicyJSON(e.PolicyJSON, e.Policy)
 }
 
 // PolicyDefinition says, for each field of an effective policy, which target's
@@ -698,14 +780,31 @@ type ResolvedPolicy struct {
 // again after the updates (spec: policy.md §3.6). SchedulingError is right
 // for every target.
 func (c *Client) ResolvePolicy(ctx context.Context, target SourceInfo, updates *Policy, numUpcomingSnapshotTimes int) (*ResolvedPolicy, error) {
+	return c.ResolvePolicyKeepingUnknown(ctx, target, updates, nil, numUpcomingSnapshotTimes)
+}
+
+// ResolvePolicyKeepingUnknown is ResolvePolicy with updates as
+// SetPolicyKeepingUnknown would write them over stored, the policy target
+// stores, or nil for none, so that SchedulingError judges the scheduling
+// section a write would send, kept fields included: Kopia refuses manual
+// scheduling combined with any other field of the section, whether Policy
+// models it or not.
+func (c *Client) ResolvePolicyKeepingUnknown(ctx context.Context, target SourceInfo, updates *Policy, stored json.RawMessage, numUpcomingSnapshotTimes int) (*ResolvedPolicy, error) {
 	if numUpcomingSnapshotTimes < 0 {
 		numUpcomingSnapshotTimes = 0
 	}
 	// Kopia requires a body; "updates": null means "use the stored policy".
 	body := struct {
-		Updates                  *Policy `json:"updates"`
-		NumUpcomingSnapshotTimes int     `json:"numUpcomingSnapshotTimes"`
-	}{updates, numUpcomingSnapshotTimes}
+		Updates                  json.RawMessage `json:"updates"`
+		NumUpcomingSnapshotTimes int             `json:"numUpcomingSnapshotTimes"`
+	}{json.RawMessage("null"), numUpcomingSnapshotTimes}
+	if updates != nil {
+		merged, err := mergePolicyJSON(stored, updates)
+		if err != nil {
+			return nil, fmt.Errorf("POST /api/v1/policy/resolve for %s: merging the updates into the stored policy: %w", target, err)
+		}
+		body.Updates = merged
+	}
 
 	var resolved ResolvedPolicy
 	if err := c.do(ctx, http.MethodPost, "/api/v1/policy/resolve", target.query(), body, &resolved); err != nil {

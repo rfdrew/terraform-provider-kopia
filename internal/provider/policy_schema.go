@@ -25,8 +25,9 @@ import (
 // small description of its own, policyAttr, rather than either of them.
 //
 // Every section is a single nested attribute, not a block, and none is
-// computed: kopia_policy owns the whole policy of its target, and an
-// attribute left out means "not set here, inherit it". Kopia's pointer fields
+// computed: kopia_policy owns every setting of its target's policy that it
+// has an attribute for, and an attribute left out means "not set here,
+// inherit it". Kopia's pointer fields
 // map to attributes whose null, false and 0 are three different things; its
 // plain fields cannot store false, 0, "" or an empty list at all, so their
 // validators refuse those values, except a plain false, which is accepted and

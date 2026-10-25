@@ -117,6 +117,29 @@ func TestPoliciesDataSourceFilters(t *testing.T) {
 	requireProtocolErrorContaining(t, diags, "at least 1")
 }
 
+// policy_json also holds the fields kopia_policy has no attribute for, as
+// Kopia sent them, empty ones included, after the ones it has; the fields it
+// has attributes for read the same whichever release answered.
+func TestPoliciesDataSourceShowsWhatTheProviderDoesNotModel(t *testing.T) {
+	const want = `docker@host1|host1|docker|-|{"retention":{"keepDaily":7,"keepQuarterly":4},"logging":{"entries":{"newLevel":1}},` +
+		`"encryption":{"keys":[{"id":"a"}],"mode":"strict"},"newFlag":true,"newSection":{}}`
+	for _, compact := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compact=%v", compact), func(t *testing.T) {
+			fake := newFakeKopia()
+			store := newPolicyTestStore(fake)
+			store.compact = compact
+			store.putRaw(t, "docker@host1", `{"newFlag":true,"logging":{"entries":{"newLevel":1}},"retention":{"keepQuarterly":4,"keepDaily":7},`+
+				`"encryption":{"mode":"strict","keys":[{"id":"a"}]},"newSection":{}}`)
+			h := policyTestHarness(t, fake)
+
+			state := h.readDataSource(t, "kopia_policies", h.dataSourceValue(t, "kopia_policies", map[string]any{}))
+			if got := policiesTestEntries(t, state); strings.Join(got, "\n") != want {
+				t.Errorf("policies =\n%s\nwant\n%s", strings.Join(got, "\n"), want)
+			}
+		})
+	}
+}
+
 func TestPoliciesDataSourceReportsKopiasError(t *testing.T) {
 	fake := newFakeKopia()
 	fake.replyError("GET /api/v1/policies", http.StatusBadRequest, kopiaclient.CodeNotConnected, "not connected")

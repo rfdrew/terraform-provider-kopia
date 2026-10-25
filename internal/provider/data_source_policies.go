@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -98,10 +97,11 @@ func (d *policiesDataSource) Schema(_ context.Context, _ datasource.SchemaReques
 						"policy_json": schema.StringAttribute{
 							Computed: true,
 							MarkdownDescription: "The stored policy as compact JSON with Kopia's own field " +
-								"names, such as `{\"retention\":{\"keepDaily\":14}}`, for `jsondecode`. Empty " +
-								"sections are left out, so the text is the same whichever Kopia release " +
-								"answered; so are fields this provider does not know, which a later Kopia " +
-								"release might add.",
+								"names, such as `{\"retention\":{\"keepDaily\":14}}`, for `jsondecode`. The " +
+								"settings `kopia_policy` has attributes for come first, with empty sections left " +
+								"out, so that they read the same whichever Kopia release answered; any other " +
+								"setting Kopia stores, such as one a later release adds, follows as Kopia " +
+								"reports it, empty values included.",
 						},
 					},
 				},
@@ -144,11 +144,7 @@ func (d *policiesDataSource) Read(ctx context.Context, req datasource.ReadReques
 
 	config.Policies = make([]policiesDataSourceItem, 0, len(entries))
 	for _, entry := range entries {
-		policy := kopiaclient.Policy{}
-		if entry.Policy != nil {
-			policy = *entry.Policy
-		}
-		encoded, err := json.Marshal(policy)
+		encoded, err := entry.CanonicalJSON()
 		if err != nil {
 			resp.Diagnostics.AddError("Unable to encode Kopia policy",
 				"Encoding the policy of "+entry.Target.String()+" as JSON failed. This is a bug in the provider. "+err.Error())

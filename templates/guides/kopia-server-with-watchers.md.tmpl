@@ -62,9 +62,10 @@ path again under a new name, and the policies below no longer apply to them.
 Two rules follow from how each side writes a policy:
 
 * **Never describe a path policy the watcher manages in Terraform.**
-  `kopia_policy` owns the whole policy of its target and replaces it on every
-  apply, while the watcher writes the fields of its labels and the pause into
-  it: each would undo the other's changes, at every apply and at every full
+  `kopia_policy` owns every setting of its target's policy that it has an
+  attribute for, everything the watcher writes included, and rewrites them on
+  every apply, while the watcher writes the fields of its labels and the pause
+  into it: each would undo the other's changes, at every apply and at every full
   reconcile of the watcher. Creating a `kopia_policy` for a path the watcher
   has already registered fails, because the policy exists; importing it would
   only start the tug of war.
