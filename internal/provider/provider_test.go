@@ -1,8 +1,11 @@
 package provider
 
 import (
+	"bytes"
 	"errors"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -46,6 +49,69 @@ const (
 	envAccSourceHost = "KOPIA_ACC_SOURCE_HOST"
 	envAccSourceUser = "KOPIA_ACC_SOURCE_USER"
 )
+
+// envAccRestart, set to 1, lets acceptance tests restart the test server with
+// scripts/bootstrap-test-kopia.sh --restart. Set it only when that script
+// started the server, and give go test the KOPIA_TEST_* settings it was
+// started with: the script restarts only a server started from the same image
+// in the same mode. Run these tests on their own, as CI does, because a
+// restart fails whatever reaches the server meanwhile, and `go test ./...`
+// runs the packages' tests at the same time:
+//
+//	KOPIA_ACC_RESTART=1 TF_ACC=1 go test ./internal/provider -run '^TestAcc.*_restart$' -count=1
+const envAccRestart = "KOPIA_ACC_RESTART"
+
+// testAccPreCheckRestart skips a test that restarts the server unless
+// KOPIA_ACC_RESTART is 1.
+func testAccPreCheckRestart(t *testing.T) {
+	t.Helper()
+	if os.Getenv(envAccRestart) != "1" {
+		t.Skipf("set %s=1 to run acceptance tests that restart the test server", envAccRestart)
+	}
+}
+
+// testAccRestartServer restarts the test server with
+// scripts/bootstrap-test-kopia.sh --restart, which keeps the repository and
+// its config file, and takes over the variables the script exports. With TLS,
+// Kopia generates a new certificate whenever it starts, so the fingerprint
+// changes; the new values replace the old ones for the rest of the process,
+// not for this test alone, because the old ones no longer match the server.
+func testAccRestartServer(t *testing.T) {
+	t.Helper()
+	var stderr bytes.Buffer
+	cmd := exec.Command("bash", "../../scripts/bootstrap-test-kopia.sh", "--restart")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	t.Logf("scripts/bootstrap-test-kopia.sh --restart:\n%s", stderr.String())
+	if err != nil {
+		t.Fatalf("restarting the test server: %v", err)
+	}
+
+	// The script prints `export NAME=value` and `unset NAME...` lines, quoted
+	// with printf %q, which leaves the values it exports as they are.
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if names, ok := strings.CutPrefix(line, "unset "); ok {
+			for _, name := range strings.Fields(names) {
+				if err := os.Unsetenv(name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			continue
+		}
+		assignment, isExport := strings.CutPrefix(line, "export ")
+		name, value, ok := strings.Cut(assignment, "=")
+		if !isExport || !ok {
+			t.Fatalf("unexpected line from scripts/bootstrap-test-kopia.sh: %q", line)
+		}
+		if strings.ContainsAny(value, "\\'\"$ ") {
+			// The value itself is left out: it may be a password.
+			t.Fatalf("scripts/bootstrap-test-kopia.sh exported %s quoted, which this test cannot read", name)
+		}
+		if err := os.Setenv(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 // testAccClient connects to the acceptance server the way the provider does,
 // from the same KOPIA_SERVER_* environment variables and through the same

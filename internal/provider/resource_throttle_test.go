@@ -13,6 +13,7 @@ import (
 	"time"
 
 	acc "github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
 	"github.com/rfdrew/terraform-provider-kopia/internal/kopiaclient"
@@ -585,6 +586,90 @@ resource "kopia_throttle" "this" {
 			{
 				// A refresh of an unchanged configuration plans nothing.
 				RefreshState: true,
+			},
+		},
+	})
+}
+
+// TestAccThrottleResource_restart restarts the server between two plans.
+// Kopia saves the limits in its config file and applies them again when it
+// opens the repository at start, so afterwards the server reports the same
+// limits and the next plan is empty. It runs only with KOPIA_ACC_RESTART set;
+// see envAccRestart.
+func TestAccThrottleResource_restart(t *testing.T) {
+	// The rates are generous because they already throttle the server while
+	// it opens the repository again.
+	want := kopiaclient.ThrottleLimits{
+		ReadsPerSecond:         100,
+		WritesPerSecond:        50.5,
+		ListsPerSecond:         20.5,
+		UploadBytesPerSecond:   10485760,
+		DownloadBytesPerSecond: 20971520,
+		ConcurrentReads:        16,
+		ConcurrentWrites:       8,
+	}
+	config := providerConfig + `
+resource "kopia_throttle" "this" {
+  reads_per_second                    = 100
+  writes_per_second                   = 50.5
+  lists_per_second                    = 20.5
+  max_upload_speed_bytes_per_second   = 10485760
+  max_download_speed_bytes_per_second = 20971520
+  concurrent_reads                    = 16
+  concurrent_writes                   = 8
+}
+`
+	checkServerLimits := func() error {
+		limits, err := testAccThrottleLimits()
+		if err != nil {
+			return err
+		}
+		if *limits != want {
+			return fmt.Errorf("server limits = %+v, want %+v", *limits, want)
+		}
+		return nil
+	}
+
+	acc.Test(t, acc.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testAccPreCheckRestart(t)
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckThrottleRemoved,
+		Steps: []acc.TestStep{
+			{
+				Config: config,
+				Check:  func(*terraform.State) error { return checkServerLimits() },
+			},
+			{
+				// The server is asked for its limits before Terraform reads
+				// them, and the plan, refresh included, must not change them.
+				// The repository status holds the limits the config file had
+				// when the repository was opened, so it shows that they came
+				// back from there.
+				PreConfig: func() {
+					testAccRestartServer(t)
+					if err := checkServerLimits(); err != nil {
+						t.Errorf("after the restart: %v", err)
+					}
+					c, err := testAccClient()
+					if err != nil {
+						t.Fatal(err)
+					}
+					status, err := c.RepoStatus(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if status.ThrottlingLimits == nil || *status.ThrottlingLimits != want {
+						t.Errorf("after the restart the repository was opened with limits %+v, want %+v",
+							status.ThrottlingLimits, want)
+					}
+				},
+				Config: config,
+				ConfigPlanChecks: acc.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
 			},
 		},
 	})

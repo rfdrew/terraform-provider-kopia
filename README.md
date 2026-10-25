@@ -281,7 +281,22 @@ Besides the `KOPIA_SERVER_*` variables it exports what some acceptance tests
 need to know about the server, such as the identity it takes snapshots as
 (`KOPIA_ACC_SOURCE_HOST`, `KOPIA_ACC_SOURCE_USER`). CI runs the acceptance
 tests against Kopia 0.22.3 and 0.23.1 on Terraform 1.12 and 1.14, once over
-HTTPS, and once with the latest OpenTofu.
+HTTPS, once with the latest OpenTofu, and once against Kopia 0.22.0, whose
+policy JSON leaves empty sections out.
+
+Tests that restart the server, such as the one checking that throttle limits
+survive a restart, run only with `KOPIA_ACC_RESTART=1`. They restart it with
+`scripts/bootstrap-test-kopia.sh --restart`, which restarts only a server it
+started from the same image in the same mode, so give them the `KOPIA_TEST_*`
+settings the server was started with. Run them on their own, as CI does,
+because a restart fails whatever else reaches the server meanwhile. With TLS
+the server has a new certificate afterwards, so export its fingerprint again
+by running the boot command once more, which reuses the server:
+
+```shell
+KOPIA_TEST_TLS=1 KOPIA_ACC_RESTART=1 TF_ACC=1 go test ./internal/provider -run '^TestAcc.*_restart$' -count=1 -v
+eval "$(KOPIA_TEST_TLS=1 make kopia-up)"   # reuses the server, exports its new fingerprint
+```
 
 > Acceptance tests create, change and delete real policies, notification
 > profiles and settings, and reset the global policy to Kopia's defaults.
