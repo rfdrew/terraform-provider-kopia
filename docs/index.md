@@ -1,0 +1,177 @@
+---
+page_title: "Provider: Kopia"
+description: |-
+  Manage the configuration of a running Kopia server — snapshot policies, notification profiles, throttling and the repository description — through the HTTP API behind its web UI.
+---
+
+# Kopia Provider
+
+Manages the configuration of a running [Kopia](https://kopia.io) server —
+snapshot policies, notification profiles, throttling and the repository
+description — through the HTTP API behind its web UI, the one
+`kopia server start` serves.
+
+## Compatibility
+
+**Provider 0.1.0** (unreleased) is built and verified against **Kopia 0.23.1**.
+The 0.22 and 0.23 releases are supported; the provider warns when the server
+reports another release, because Kopia's web UI API is internal and unversioned.
+
+| Provider | Verified against | Supported Kopia | Terraform | OpenTofu |
+| --- | --- | --- | --- | --- |
+| 0.1.0 (unreleased) | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
+
+| Feature | Needs |
+| --- | --- |
+| Import by resource identity (`kopia_policy`, `kopia_notification_profile`) | Terraform 1.12 |
+
+## What it manages
+
+* **Policies** — `kopia_policy`, which owns the whole policy of one target:
+  `(global)`, `@host`, `user@host` or a directory. The `kopia_policies` data
+  source lists the targets that have a policy, and `kopia_effective_policy`
+  resolves what a target inherits, where each value comes from and when its
+  next snapshots are due.
+* **Notifications** — `kopia_notification_profile` for email, Pushover and
+  webhook profiles, and the `kopia_notification_profiles` data source, which
+  lists them without their secrets.
+* **Server settings** — `kopia_throttle`, the server's storage and bandwidth
+  limits, and `kopia_repository_description`, the name the Kopia UI shows for
+  the repository.
+* **Read-only information** — `kopia_repository_status` (the repository and the
+  identity the server takes snapshots as), `kopia_current_user` (the account
+  the server process runs as), `kopia_algorithms`, `kopia_sources` and
+  `kopia_snapshots`.
+
+Running Kopia servers next to
+[kopia-docker-watcher](https://github.com/rfdrew/kopia-docker-watcher), which
+keeps the policies of container paths in line with Docker labels? The guide
+**Kopia server with kopia-docker-watcher** splits the configuration between
+the two.
+
+## Scope and limitations
+
+The provider uses only the HTTP API that Kopia's web UI calls. That API is not
+documented or versioned, which is why the supported Kopia releases are pinned
+above, and it does not reach everything the `kopia` command line does:
+**repository server users (`kopia server user`), their access rules
+(`kopia server acl`) and maintenance settings (`kopia maintenance set`) can
+only be managed with the CLI.** Creating or connecting a repository is
+possible over the API but deliberately left out, because storage credentials
+would end up in Terraform state, and destroying it could only disconnect:
+connect the server to its repository before `kopia server start`.
+
+The server must serve that API to the provider:
+
+* **The web UI must be enabled.** A server started with `--no-ui` serves none
+  of the API, and the provider fails to connect.
+* **The provider signs in as the UI user**, the `--server-username` (default
+  `kopia`) and `--server-password` of `kopia server start`. The server-control
+  user and repository users are refused.
+* **CSRF protection stays on.** Like the web UI, the provider fetches a CSRF
+  token from the UI page and fetches a new one when a server restart has
+  invalidated it, so `--disable-csrf-token-checks` is never needed.
+
+Where Kopia keeps what the provider manages decides who shares it and what
+survives:
+
+* **Policies and notification profiles live in the repository.** Every Kopia
+  server and client connected to the same repository shares them, and they
+  survive restarts. The server the provider writes to applies a change at once;
+  other servers of the same repository pick it up at their next refresh
+  (`kopia server start --refresh-interval`, four hours by default) or after
+  `kopia server refresh`.
+* **The throttle limits and the repository description live in the server's
+  config file**, `repository.config`, so each server has its own. Keep that
+  file on persistent, writable storage, such as a volume on `/app/config` for
+  the official Docker image. Disconnecting or reconnecting the repository
+  replaces the file, and with it both settings.
+
+Within that API, some objects cannot be expressed exactly; each affected
+attribute says so in its own documentation, and the most consequential cases
+are:
+
+| Limitation | Effect |
+| --- | --- |
+| Kopia stores some settings only when they are `true` (`no_parent*`, `scheduling.manual`) | `false` there means the same as leaving the attribute out, so it cannot switch off what is inherited |
+| Deleting the global policy removes it for good | Destroying a `kopia_policy` for `(global)` resets it to Kopia's defaults instead |
+| Kopia overwrites an existing policy or profile without a word | Creating `kopia_policy` (except for `(global)`) or `kopia_notification_profile` for one that exists fails; import it instead |
+| Kopia accepts any compressor or splitter name and any notification setting, and silently ignores what it cannot use | The provider checks them at plan time, against the server's algorithms where it can, and checks cron entries with the server too |
+| Notification secrets are returned on every read | SMTP passwords, Pushover tokens and webhook URLs and headers are kept in state, marked sensitive |
+| The throttle limits cannot be removed, only set to unlimited | Destroying `kopia_throttle` saves "unlimited"; limits from the storage configuration do not come back |
+| The repository description can be set but not removed | Destroying `kopia_repository_description` leaves it in place |
+
+## Authentication
+
+The provider signs in as the server's **UI user**: the one
+`kopia server start` names with `--server-username` (default `kopia`) and
+`--server-password`. The server-control user and repository users are refused
+by this API, and a server started with `--no-ui` does not serve it at all.
+
+Prefer the environment over configuration so the password stays out of your
+configuration and version control:
+
+```shell
+export KOPIA_SERVER_URL="https://kopia.example.com:51515"
+export KOPIA_SERVER_USERNAME="kopia"
+export KOPIA_SERVER_PASSWORD="…"
+# For a server that generated its own certificate (--tls-generate-cert):
+export KOPIA_SERVER_CERT_FINGERPRINT="cd50843049f0c6da48255e8022728d28124cb5b72fc3a2d81be496219c2cccf3"
+```
+
+`kopia server start --tls-generate-cert` prints the fingerprint as
+`SERVER CERT SHA256: …`, but generates a new certificate, and with it a new
+fingerprint, on every start unless it is given `--tls-cert-file` and
+`--tls-key-file`. To pin a fingerprint, generate the certificate once into
+those files on a volume, then start the server with them and without
+`--tls-generate-cert`. For a certificate from a private CA, use
+`ca_cert_file` instead.
+
+~> **Note** Kopia's own client commands (`kopia server status` and the like)
+read `KOPIA_SERVER_USERNAME` and `KOPIA_SERVER_PASSWORD` as the
+*server-control* credentials, while the provider reads them as the UI user's.
+
+## Example Usage
+
+```terraform
+terraform {
+  required_providers {
+    kopia = {
+      source  = "rfdrew/kopia"
+      version = "~> 0.1"
+    }
+  }
+}
+
+# Credentials are best supplied through the environment so they stay out of the
+# configuration: KOPIA_SERVER_URL, KOPIA_SERVER_USERNAME and
+# KOPIA_SERVER_PASSWORD.
+provider "kopia" {
+  url      = "https://kopia.example.com:51515"
+  username = "kopia"
+  password = var.kopia_password
+
+  # The server generated its own certificate (`kopia server start
+  # --tls-generate-cert`) and printed its fingerprint as "SERVER CERT SHA256".
+  tls_cert_fingerprint = "cd50843049f0c6da48255e8022728d28124cb5b72fc3a2d81be496219c2cccf3"
+}
+
+variable "kopia_password" {
+  description = "Password of the kopia server's UI user, as given to `kopia server start --server-password`."
+  type        = string
+  sensitive   = true
+}
+```
+
+<!-- schema generated by tfplugindocs -->
+## Schema
+
+### Optional
+
+- `ca_cert_file` (String) Path to a PEM file of CA certificates to verify the server's certificate with, instead of the system's trusted roots. A self-signed certificate can serve as its own CA; the host name in `url` must then be one of the names in the certificate. Conflicts with `tls_cert_fingerprint` and `insecure_skip_verify`. May also be set with the `KOPIA_SERVER_CA_FILE` environment variable.
+- `insecure_skip_verify` (Boolean) Skip verification of the server's TLS certificate. Defaults to `false`. Prefer `tls_cert_fingerprint`, which trusts exactly one certificate. Conflicts with `tls_cert_fingerprint` and `ca_cert_file`. May also be set with the `KOPIA_SERVER_INSECURE_SKIP_VERIFY` environment variable.
+- `password` (String, Sensitive) Password of the UI user, as given to `kopia server start --server-password`. Required, here or in the environment. May also be set with the `KOPIA_SERVER_PASSWORD` environment variable.
+- `request_timeout` (String) Time limit for each HTTP request to the server, as a Go duration such as `30s` or `2m`. Defaults to `30s`. Kopia finishes a request even when the provider has stopped waiting for it, so a write that timed out may still have taken effect. May also be set with the `KOPIA_SERVER_REQUEST_TIMEOUT` environment variable.
+- `tls_cert_fingerprint` (String) SHA-256 fingerprint of the server's TLS certificate, to trust that one certificate instead of verifying it against certificate authorities; the host name is then not checked. A server started with `--tls-generate-cert` prints it as `SERVER CERT SHA256: …`, and `openssl x509 -noout -fingerprint -sha256 -in cert.pem` prints it for any certificate: 64 hexadecimal digits in either case, optionally separated by colons. Conflicts with `ca_cert_file` and `insecure_skip_verify`. May also be set with the `KOPIA_SERVER_CERT_FINGERPRINT` environment variable.
+- `url` (String) Root URL of the Kopia server, e.g. `https://kopia.example.com:51515`: the address `kopia server start --address` listens on, or the one a reverse proxy serves it under. Required, here or in the environment. May also be set with the `KOPIA_SERVER_URL` environment variable.
+- `username` (String) Name of the server's UI user, as given to `kopia server start --server-username`. Defaults to `kopia`, Kopia's own default. May also be set with the `KOPIA_SERVER_USERNAME` environment variable.

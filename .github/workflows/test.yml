@@ -1,0 +1,174 @@
+# Build, lint and test on every push and pull request.
+#
+# The unit tests fake kopia in process and need nothing else. The docs job
+# regenerates docs/ twice — through Terraform, as tfplugindocs normally does,
+# and offline from the schema tools/providerschema dumps — and fails when
+# either result differs from what is committed, so the offline path that
+# sandboxed development relies on cannot drift from the real one.
+#
+# The acceptance job boots a throwaway kopia server with a filesystem
+# repository, password and CSRF protection on, so the provider is exercised
+# against the real API rather than a fake. Kopia's web UI API is internal and
+# unversioned, so it runs against the latest release of each supported line,
+# on the first Terraform with resource identity and on the newest one. One
+# more run serves HTTPS with kopia's generated certificate, pinned by its
+# fingerprint, and one runs the suite with the latest OpenTofu.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build, lint and unit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - run: go build ./...
+
+      # golangci-lint must be built with a Go at least as new as the go
+      # directive in go.mod, so a pinned old release would refuse to run as
+      # soon as go.mod moves on.
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+      - name: Verify the bootstrap script parses
+        run: bash -n scripts/bootstrap-test-kopia.sh
+
+      - name: Unit tests
+        run: make test
+
+  docs:
+    name: docs are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Regenerate docs through Terraform
+        run: make docs
+
+      - name: Fail if docs are stale
+        run: |
+          if ! git diff --exit-code -- docs/; then
+            echo "docs/ is out of date - run 'make docs' and commit the result."
+            exit 1
+          fi
+
+      - name: Regenerate docs offline
+        run: make docs-offline
+
+      - name: Fail if the offline docs differ
+        run: |
+          if ! git diff --exit-code -- docs/; then
+            echo "make docs-offline renders docs/ differently from make docs - tools/providerschema needs fixing."
+            exit 1
+          fi
+
+      - name: Validate docs and examples
+        run: make docs-validate
+
+  acceptance:
+    name: acceptance tests (Kopia ${{ matrix.kopia }}, ${{ matrix.cli }} ${{ matrix.cli_version }}${{ matrix.tls == '1' && ', TLS' || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kopia: ["0.22.3", "0.23.1"]
+        cli: [terraform]
+        cli_version: ["1.12.*", "1.14.*"]
+        tls: ["0"]
+        include:
+          - kopia: "0.23.1"
+            cli: terraform
+            cli_version: "1.14.*"
+            tls: "1"
+          - kopia: "0.23.1"
+            cli: tofu
+            cli_version: latest
+            tls: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: hashicorp/setup-terraform@v3
+        if: matrix.cli == 'terraform'
+        with:
+          terraform_version: ${{ matrix.cli_version }}
+          terraform_wrapper: false
+
+      - uses: opentofu/setup-opentofu@v1
+        if: matrix.cli == 'tofu'
+        with:
+          tofu_version: ${{ matrix.cli_version }}
+          tofu_wrapper: false
+
+      # terraform-plugin-testing runs whatever TF_ACC_TERRAFORM_PATH names.
+      # OpenTofu resolves the provider under its own registry host, so the
+      # in-process provider has to be registered under that host too.
+      - name: Run the tests with OpenTofu
+        if: matrix.cli == 'tofu'
+        run: |
+          echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)" >> "$GITHUB_ENV"
+          echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org" >> "$GITHUB_ENV"
+
+      - name: Boot a kopia server
+        env:
+          KOPIA_TEST_IMAGE: kopia/kopia:${{ matrix.kopia }}
+          KOPIA_TEST_TLS: ${{ matrix.tls }}
+        run: |
+          chmod +x scripts/bootstrap-test-kopia.sh
+          scripts/bootstrap-test-kopia.sh > /tmp/kopia.env
+          # The script prints `export` and `unset` lines on stdout; feed the
+          # exports into the job environment without echoing the password
+          # into the log.
+          sed -n 's/^export //p' /tmp/kopia.env >> "$GITHUB_ENV"
+
+      - name: Acceptance tests
+        env:
+          TF_ACC: "1"
+        run: go test ./... -v -timeout 30m
+
+      - name: Kopia logs on failure
+        if: failure()
+        run: docker logs --tail 200 kopia-tfprovider-test || true
+
+      - name: Tear down kopia
+        if: always()
+        run: scripts/bootstrap-test-kopia.sh --teardown || true
