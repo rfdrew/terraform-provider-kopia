@@ -12,7 +12,10 @@
 # unversioned, so it runs against the latest release of each supported line,
 # on the first Terraform with resource identity and on the newest one. One
 # more run serves HTTPS with kopia's generated certificate, pinned by its
-# fingerprint, and one runs the suite with the latest OpenTofu.
+# fingerprint, one runs the suite with the latest OpenTofu, and one runs it
+# against Kopia 0.22.0, the only supported release that leaves empty sections
+# out of its policy JSON. Every run then restarts the server for the tests
+# that check what must survive a restart.
 name: test
 
 on:
@@ -28,9 +31,9 @@ jobs:
     name: build, lint and unit test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -53,12 +56,15 @@ jobs:
 
       - run: go build ./...
 
-      # golangci-lint must be built with a Go at least as new as the go
-      # directive in go.mod, so a pinned old release would refuse to run as
-      # soon as go.mod moves on.
-      - uses: golangci/golangci-lint-action@v8
+      # Pinned, so that a new golangci-lint release cannot fail CI on its own.
+      # golangci-lint refuses to lint a module whose Go version (major.minor
+      # of the toolchain line in go.mod, or else of the go directive) is newer
+      # than the Go it was built with. v2.15.0 was built with Go 1.27, so raise
+      # the pin before go.mod moves past 1.27, and expect new findings from the
+      # standard linters when you do.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.15.0
 
       - name: Verify the bootstrap script parses
         run: bash -n scripts/bootstrap-test-kopia.sh
@@ -70,9 +76,9 @@ jobs:
     name: docs are up to date
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -103,6 +109,12 @@ jobs:
   acceptance:
     name: acceptance tests (Kopia ${{ matrix.kopia }}, ${{ matrix.cli }} ${{ matrix.cli_version }}${{ matrix.tls == '1' && ', TLS' || '' }})
     runs-on: ubuntu-latest
+    # Job-wide, so that the restart in the acceptance tests finds the server
+    # the boot step started: the script restarts only a server started from
+    # the same image in the same mode.
+    env:
+      KOPIA_TEST_IMAGE: kopia/kopia:${{ matrix.kopia }}
+      KOPIA_TEST_TLS: ${{ matrix.tls }}
     strategy:
       fail-fast: false
       matrix:
@@ -115,25 +127,31 @@ jobs:
             cli: terraform
             cli_version: "1.14.*"
             tls: "1"
+          # The client normalises the policy JSON of 0.22.0, which leaves
+          # empty sections out (omitzero) where later releases send {}.
+          - kopia: "0.22.0"
+            cli: terraform
+            cli_version: "1.14.*"
+            tls: "0"
           - kopia: "0.23.1"
             cli: tofu
             cli_version: latest
             tls: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         if: matrix.cli == 'terraform'
         with:
           terraform_version: ${{ matrix.cli_version }}
           terraform_wrapper: false
 
-      - uses: opentofu/setup-opentofu@v1
+      - uses: opentofu/setup-opentofu@v2
         if: matrix.cli == 'tofu'
         with:
           tofu_version: ${{ matrix.cli_version }}
@@ -149,9 +167,6 @@ jobs:
           echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org" >> "$GITHUB_ENV"
 
       - name: Boot a kopia server
-        env:
-          KOPIA_TEST_IMAGE: kopia/kopia:${{ matrix.kopia }}
-          KOPIA_TEST_TLS: ${{ matrix.tls }}
         run: |
           chmod +x scripts/bootstrap-test-kopia.sh
           scripts/bootstrap-test-kopia.sh > /tmp/kopia.env
@@ -164,6 +179,15 @@ jobs:
         env:
           TF_ACC: "1"
         run: go test ./... -v -timeout 30m
+
+      # These tests restart the server with scripts/bootstrap-test-kopia.sh
+      # --restart, which fails whatever else reaches it meanwhile, so they run
+      # on their own; without KOPIA_ACC_RESTART the step above skips them.
+      - name: Acceptance tests across a kopia restart
+        env:
+          TF_ACC: "1"
+          KOPIA_ACC_RESTART: "1"
+        run: go test ./internal/provider -run '^TestAcc.*_restart$' -count=1 -v -timeout 10m
 
       - name: Kopia logs on failure
         if: failure()
