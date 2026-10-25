@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	datasourceschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
@@ -241,8 +242,9 @@ func TestPolicySchemasDescribeEveryAttribute(t *testing.T) {
 	}
 }
 
-// The policy's sections are optional, never computed: kopia_policy owns the
-// whole policy, and a section left out is inherited, not adopted.
+// The policy's sections are optional, never computed: kopia_policy owns every
+// setting it has an attribute for, and a section left out is inherited, not
+// adopted.
 func TestPolicySectionsAreOptionalOnly(t *testing.T) {
 	s := resourceSchema(t, NewPolicyResource())
 	for name, a := range s.Attributes {
@@ -702,6 +704,317 @@ func TestPolicyResourceUpdateRewritesTheWholePolicy(t *testing.T) {
 	}
 }
 
+// A later Kopia release can store fields kopia_policy has no attribute for,
+// which a user may set in the Kopia UI. They never show up in state, and every
+// write keeps them, at every level of the policy, while the fields the
+// resource has attributes for follow the configuration however they were set
+// outside Terraform. A time of day keeps the fields of the stored one it
+// equals; an action keeps them while it runs the same command, and goes with
+// them when it runs another or is removed.
+func TestPolicyResourceKeepsWhatItDoesNotModel(t *testing.T) {
+	for _, compact := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compact=%v", compact), func(t *testing.T) {
+			fake := newFakeKopia()
+			store := newPolicyTestStore(fake)
+			store.compact = compact
+			h := policyTestHarness(t, fake)
+			times := []any{map[string]any{"hour": 3, "minute": 15}}
+
+			inst := policyTestApply(t, h, nil, policyTestConfig(t, h, map[string]any{
+				"target":     "docker@host1",
+				"retention":  map[string]any{"keep_daily": 7},
+				"scheduling": map[string]any{"time_of_day": times},
+				"actions":    map[string]any{"before_snapshot_root": map[string]any{"command": "/bin/dump"}},
+			}))
+
+			store.putRaw(t, "docker@host1", `{"retention":{"keepDaily":7,"keepHourly":48,"keepQuarterly":4},`+
+				`"scheduling":{"timeOfDay":[{"hour":3,"min":15,"sec":30}]},`+
+				`"actions":{"beforeSnapshotRoot":{"path":"/bin/dump","retries":3}},`+
+				`"osSnapshots":{"volumeShadowCopy":{"newOption":"x"}},"logging":{"directories":{"newLevel":2}},`+
+				`"encryption":{"mode":"strict"},"newFlag":true}`)
+			refreshed := h.refresh(t, inst)
+			if got := int64At(t, refreshed.state, "retention", "keep_hourly"); got != 48 {
+				t.Errorf("refreshed retention.keep_hourly = %d, want what was set outside Terraform", got)
+			}
+
+			config := policyTestConfig(t, h, map[string]any{
+				"target":     "docker@host1",
+				"retention":  map[string]any{"keep_daily": 14},
+				"scheduling": map[string]any{"interval_seconds": 3600, "time_of_day": times},
+				"actions":    map[string]any{"before_snapshot_root": map[string]any{"command": "/bin/dump", "timeout_seconds": 300}},
+			})
+			inst = policyTestApply(t, h, refreshed, config)
+			const kept = `"osSnapshots":{"volumeShadowCopy":{"newOption":"x"}},"logging":{"directories":{"newLevel":2}},` +
+				`"encryption":{"mode":"strict"},"newFlag":true}`
+			want := `{"retention":{"keepDaily":14,"keepQuarterly":4},` +
+				`"scheduling":{"intervalSeconds":3600,"timeOfDay":[{"hour":3,"min":15,"sec":30}]},` +
+				`"actions":{"beforeSnapshotRoot":{"path":"/bin/dump","timeout":300,"retries":3}},` + kept
+			if got := policyTestPutBody(t, fake); got != want {
+				t.Errorf("PUT body =\n%s\nwant\n%s", got, want)
+			}
+			// The stored policy was read right before the write.
+			if got := fake.apiRoutes(); strings.Join(got[len(got)-3:], ",") != "GET /api/v1/policy,PUT /api/v1/policy,GET /api/v1/policy" {
+				t.Errorf("API calls = %v, want them to end with a read, the write and the read-back", got)
+			}
+
+			// Importing it finds the configuration again, with nothing to change.
+			imported := h.importByID(t, policyTestType, "docker@host1")
+			policyTestRequireEqual(t, "imported state", imported.state, "state after apply", inst.state)
+			planned := h.plan(t, policyTestType, imported, config)
+			requireNoProtocolErrors(t, planned.Diagnostics)
+			policyTestRequireEqual(t, "plan after import", h.decodeResource(t, policyTestType, planned.PlannedState), "imported state", imported.state)
+
+			inst = policyTestApply(t, h, inst, policyTestConfig(t, h, map[string]any{
+				"target":     "docker@host1",
+				"retention":  map[string]any{"keep_daily": 14},
+				"scheduling": map[string]any{"interval_seconds": 3600, "time_of_day": times},
+				"actions":    map[string]any{"before_snapshot_root": map[string]any{"command": "/bin/dump2", "timeout_seconds": 300}},
+			}))
+			want = `{"retention":{"keepDaily":14,"keepQuarterly":4},` +
+				`"scheduling":{"intervalSeconds":3600,"timeOfDay":[{"hour":3,"min":15,"sec":30}]},` +
+				`"actions":{"beforeSnapshotRoot":{"path":"/bin/dump2","timeout":300}},` + kept
+			if got := policyTestPutBody(t, fake); got != want {
+				t.Errorf("PUT body after changing the command =\n%s\nwant\n%s", got, want)
+			}
+
+			// The UI sets an unknown field of the new command too; removing
+			// the action from the configuration removes it with that field.
+			store.putRaw(t, "docker@host1", `{"retention":{"keepDaily":14,"keepQuarterly":4},`+
+				`"scheduling":{"intervalSeconds":3600,"timeOfDay":[{"hour":3,"min":15,"sec":30}]},`+
+				`"actions":{"beforeSnapshotRoot":{"path":"/bin/dump2","timeout":300,"retries":5}},`+kept)
+			inst = policyTestApply(t, h, inst, policyTestConfig(t, h, map[string]any{"target": "docker@host1"}))
+			want = `{"retention":{"keepQuarterly":4},` + kept
+			if got := policyTestPutBody(t, fake); got != want {
+				t.Errorf("PUT body after emptying the configuration =\n%s\nwant\n%s", got, want)
+			}
+			for _, name := range []string{"retention", "scheduling", "actions", "os_snapshots", "logging"} {
+				if !isNullAt(t, inst.state, name) {
+					t.Errorf("%s is not null: only fields kopia_policy has no attribute for are left", name)
+				}
+			}
+		})
+	}
+}
+
+// The values Kopia cannot store are sent as nothing on writes over a stored
+// policy too: an update, and the adoption of (global).
+func TestPolicyResourceKeepsWhatKopiaCannotStoreOverAStoredPolicy(t *testing.T) {
+	config := func(h *protocolHarness, target string) tftypes.Value {
+		return policyTestConfig(t, h, map[string]any{
+			"target":         target,
+			"retention":      map[string]any{},
+			"error_handling": map[string]any{},
+			"files":          map[string]any{"no_parent_ignore": false, "no_parent_dot_files": false},
+			"scheduling":     map[string]any{"manual": false, "no_parent_time_of_day": false},
+			"compression":    map[string]any{"no_parent_only_compress": false, "no_parent_never_compress": false},
+			"actions":        map[string]any{},
+			"os_snapshots":   map[string]any{},
+			"logging":        map[string]any{"directories": map[string]any{}},
+			"upload":         map[string]any{},
+			"no_parent":      false,
+		})
+	}
+	for _, compact := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compact=%v", compact), func(t *testing.T) {
+			fake := newFakeKopia()
+			store := newPolicyTestStore(fake)
+			store.compact = compact
+			store.putRaw(t, "(global)", policyTestDefaultGlobalJSON)
+			h := policyTestHarness(t, fake)
+
+			policyTestApply(t, h, nil, config(h, "(global)"))
+			if got := policyTestPutBody(t, fake); got != "{}" {
+				t.Errorf("PUT body adopting (global) = %s, want {}", got)
+			}
+
+			host := policyTestApply(t, h, nil, policyTestConfig(t, h, map[string]any{
+				"target": "@host1", "retention": map[string]any{"keep_daily": 1},
+			}))
+			policyTestApply(t, h, host, config(h, "@host1"))
+			if got := policyTestPutBody(t, fake); got != "{}" {
+				t.Errorf("PUT body of the update = %s, want {}", got)
+			}
+		})
+	}
+}
+
+// Adopting (global) keeps what it stores that kopia_policy has no attribute
+// for. Destroying it resets it to the policy a new repository has, which
+// forgets those fields too, as deleting any other policy does.
+func TestPolicyResourceGlobalKeepsWhatItDoesNotModel(t *testing.T) {
+	fake := newFakeKopia()
+	store := newPolicyTestStore(fake)
+	stored := strings.Replace(policyTestDefaultGlobalJSON, `"upload":{`, `"upload":{"maxParallelUploads":4,`, 1)
+	store.putRaw(t, "(global)", strings.TrimSuffix(stored, "}")+`,"newFlag":true}`)
+	h := policyTestHarness(t, fake)
+
+	inst := policyTestApply(t, h, nil, policyTestConfig(t, h, map[string]any{
+		"target":      "(global)",
+		"compression": map[string]any{"compressor_name": "zstd"},
+	}))
+	if got, want := policyTestPutBody(t, fake), `{"compression":{"compressorName":"zstd"},"upload":{"maxParallelUploads":4},"newFlag":true}`; got != want {
+		t.Errorf("PUT body = %s, want %s", got, want)
+	}
+
+	h.destroy(t, inst)
+	if got := policyTestPutBody(t, fake); got != policyTestDefaultGlobalJSON {
+		t.Errorf("PUT body of the reset =\n%s\nwant\n%s", got, policyTestDefaultGlobalJSON)
+	}
+	if got := store.stored(t, "(global)"); strings.Contains(got, "newFlag") || strings.Contains(got, "maxParallelUploads") {
+		t.Errorf("the reset global policy kept fields it does not model: %s", got)
+	}
+}
+
+// When reading the stored policy before a write fails, nothing is written:
+// writing anyway would erase whatever kopia_policy has no attribute for. A
+// null, which Kopia answers when loading the policy fails for a moment, is
+// read again first.
+func TestPolicyResourceWriteStopsWhenReadingTheStoredPolicyFails(t *testing.T) {
+	tests := []struct {
+		name  string
+		fail  func(fake *fakeKopia)
+		want  string
+		reads int
+	}{
+		{"null", func(f *fakeKopia) { f.reply("GET /api/v1/policy", http.StatusOK, "null\n") }, "Kopia answered with null", 3},
+		{"internal", func(f *fakeKopia) {
+			f.replyError("GET /api/v1/policy", http.StatusInternalServerError, kopiaclient.CodeInternal, "internal server error: boom")
+		}, "boom", 1},
+		{"not connected", func(f *fakeKopia) {
+			f.replyError("GET /api/v1/policy", http.StatusBadRequest, kopiaclient.CodeNotConnected, "not connected")
+		}, "no repository connected", 1},
+		{"not an object", func(f *fakeKopia) { f.reply("GET /api/v1/policy", http.StatusOK, `["policy"]`) }, "expected a policy object", 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &policyResource{storedReadDelays: []time.Duration{0, 0}}
+			fake := newFakeKopia()
+			tc.fail(fake)
+			fake.reply("PUT /api/v1/policy", http.StatusOK, "{}\n")
+			r.client = fake.client(t)
+
+			prior := resourceValue(t, r, map[string]any{"id": "docker@host1", "target": "docker@host1", "retention": map[string]any{"keep_daily": 7}})
+			config := resourceValue(t, r, map[string]any{"target": "docker@host1", "retention": map[string]any{"keep_daily": 8}})
+			plan := resourceValue(t, r, map[string]any{"id": "docker@host1", "target": "docker@host1", "retention": map[string]any{"keep_daily": 8}})
+			updated := updateResource(t, r, config, plan, prior)
+			requireErrorContaining(t, updated.Diagnostics, "Unable to update Kopia policy")
+			requireErrorContaining(t, updated.Diagnostics, "none was written")
+			requireErrorContaining(t, updated.Diagnostics, tc.want)
+			if !updated.State.Raw.Equal(prior) {
+				t.Errorf("state = %s, want the prior state", updated.State.Raw)
+			}
+			if got := fake.count("GET /api/v1/policy"); got != tc.reads {
+				t.Errorf("the policy was read %d times, want %d", got, tc.reads)
+			}
+
+			global := map[string]any{"target": "(global)"}
+			created := createResource(t, r, resourceValue(t, r, global), resourceValue(t, r, map[string]any{"id": "(global)", "target": "(global)"}))
+			requireErrorContaining(t, created.Diagnostics, "Unable to create Kopia policy")
+			requireErrorContaining(t, created.Diagnostics, "none was written")
+			if !created.State.Raw.IsNull() {
+				t.Errorf("state = %s, want none", created.State.Raw)
+			}
+
+			if fake.called("PUT /api/v1/policy") {
+				t.Error("a policy was written although reading the stored one failed")
+			}
+		})
+	}
+}
+
+// A null that goes away while the policy is read again before a write does
+// not stop it, and what the policy keeps is read from the answer that came.
+func TestPolicyResourceReadsTheStoredPolicyAgainAfterNull(t *testing.T) {
+	r := &policyResource{storedReadDelays: []time.Duration{0, 0}}
+	fake := newFakeKopia()
+	reads := 0
+	fake.handle("GET /api/v1/policy", func(w http.ResponseWriter, _ *http.Request) {
+		reads++
+		if reads <= 2 {
+			writeFakeResponse(w, http.StatusOK, "null\n")
+			return
+		}
+		writeFakeResponse(w, http.StatusOK, `{"retention":{"keepDaily":7},"newFlag":true}`)
+	})
+	fake.reply("PUT /api/v1/policy", http.StatusOK, "{}\n")
+	r.client = fake.client(t)
+
+	prior := resourceValue(t, r, map[string]any{"id": "docker@host1", "target": "docker@host1", "retention": map[string]any{"keep_daily": 7}})
+	config := resourceValue(t, r, map[string]any{"target": "docker@host1", "retention": map[string]any{"keep_daily": 8}})
+	plan := resourceValue(t, r, map[string]any{"id": "docker@host1", "target": "docker@host1", "retention": map[string]any{"keep_daily": 8}})
+	updated := updateResource(t, r, config, plan, prior)
+	requireNoErrors(t, updated.Diagnostics)
+	if got := policyTestPutBody(t, fake); got != `{"retention":{"keepDaily":8},"newFlag":true}` {
+		t.Errorf("PUT body = %s", got)
+	}
+	// Three reads before the write, and the read-back.
+	if reads != 4 {
+		t.Errorf("the policy was read %d times, want 4", reads)
+	}
+}
+
+// Should Kopia refuse a write over a field kopia_policy keeps, the error names
+// the kept fields of the section Kopia refused, and the ways out.
+func TestPolicyResourceWriteErrorNamesTheKeptFields(t *testing.T) {
+	r := &policyResource{}
+	fake := newFakeKopia()
+	fake.reply("GET /api/v1/policy", http.StatusOK, `{"scheduling":{"intervalSeconds":60,"jitter":30},"upload":{"maxParallelUploads":2}}`)
+	fake.replyError("PUT /api/v1/policy", http.StatusInternalServerError, kopiaclient.CodeInternal,
+		"internal server error: unable to set policy: failed to validate policy: invalid scheduling policy: manual cannot be combined with other scheduling policies")
+	r.client = fake.client(t)
+
+	prior := resourceValue(t, r, map[string]any{"id": "@host1", "target": "@host1", "scheduling": map[string]any{"interval_seconds": 60}})
+	config := resourceValue(t, r, map[string]any{"target": "@host1", "scheduling": map[string]any{"manual": true}})
+	plan := resourceValue(t, r, map[string]any{"id": "@host1", "target": "@host1", "scheduling": map[string]any{"manual": true}})
+	updated := updateResource(t, r, config, plan, prior)
+	requireAttributeError(t, updated.Diagnostics, "scheduling")
+	requireErrorContaining(t, updated.Diagnostics, "no attribute for")
+	requireErrorContaining(t, updated.Diagnostics, ": scheduling.jitter.")
+	requireErrorContaining(t, updated.Diagnostics, "terraform apply -replace")
+	for _, d := range updated.Diagnostics.Errors() {
+		if strings.Contains(d.Detail(), "maxParallelUploads") {
+			t.Errorf("a scheduling refusal names an upload field: %s", d.Detail())
+		}
+	}
+
+	// A refusal of the upload section names its kept fields, and any other
+	// failure all of them.
+	tests := []struct {
+		message, path, named, unnamed string
+	}{
+		{"internal server error: unable to set policy: failed to validate policy: invalid upload policy: max parallel snapshots cannot be specified for paths, only global, username@hostname or @hostname",
+			"upload.max_parallel_snapshots", ": upload.maxParallelUploads.", "jitter"},
+		{"internal server error: unable to set policy: failed to validate policy: invalid foo policy",
+			"", ": scheduling.jitter, upload.maxParallelUploads.", ""},
+	}
+	for _, tc := range tests {
+		fake.replyError("PUT /api/v1/policy", http.StatusInternalServerError, kopiaclient.CodeInternal, tc.message)
+		updated := updateResource(t, r, config, plan, prior)
+		if tc.path != "" {
+			requireAttributeError(t, updated.Diagnostics, tc.path)
+		}
+		requireErrorContaining(t, updated.Diagnostics, tc.named)
+		for _, d := range updated.Diagnostics.Errors() {
+			if tc.unnamed != "" && strings.Contains(d.Detail(), tc.unnamed) {
+				t.Errorf("%q names %s: %s", tc.message, tc.unnamed, d.Detail())
+			}
+		}
+	}
+
+	// A create, here the adoption of (global), cannot be undone by replacing
+	// the resource, so that is not suggested.
+	fake.replyError("PUT /api/v1/policy", http.StatusInternalServerError, kopiaclient.CodeInternal,
+		"internal server error: unable to set policy: failed to validate policy: invalid scheduling policy: manual cannot be combined with other scheduling policies")
+	created := createResource(t, r, resourceValue(t, r, map[string]any{"target": "(global)", "scheduling": map[string]any{"manual": true}}),
+		resourceValue(t, r, map[string]any{"id": "(global)", "target": "(global)", "scheduling": map[string]any{"manual": true}}))
+	requireErrorContaining(t, created.Diagnostics, ": scheduling.jitter.")
+	for _, d := range created.Diagnostics.Errors() {
+		if strings.Contains(d.Detail(), "-replace") {
+			t.Errorf("a failed create suggests replacing the resource: %s", d.Detail())
+		}
+	}
+}
+
 // Changing the target replaces the policy, and the plan knows the new id.
 func TestPolicyResourceTargetChangeReplaces(t *testing.T) {
 	fake := newFakeKopia()
@@ -943,6 +1256,74 @@ func TestPolicyResourcePlanWarnsWhenKopiaCannotCheck(t *testing.T) {
 	requireNoProtocolErrors(t, planned.Diagnostics)
 	requireProtocolWarningContaining(t, planned.Diagnostics, "Unable to check the scheduling with Kopia")
 	requireProtocolWarningContaining(t, planned.Diagnostics, "Unable to check algorithm names")
+}
+
+// Kopia refuses manual scheduling combined with any other field of the
+// section, including one kopia_policy has no attribute for, which every write
+// keeps. The plan asks Kopia about the section the write would send, so such
+// a refusal shows at plan time, naming the field and the ways out of it. A
+// policy being created keeps nothing, so nothing is read for it, except
+// (global), which is adopted.
+func TestPolicyResourcePlanChecksSchedulingWithWhatItKeeps(t *testing.T) {
+	fake := newFakeKopia()
+	store := newPolicyTestStore(fake)
+	store.putRaw(t, "(global)", `{"scheduling":{"cron":["0 1 * * *"],"jitter":30},"newFlag":true}`)
+	h := policyTestHarness(t, fake)
+
+	manual := map[string]any{"manual": true}
+	planned := h.plan(t, policyTestType, nil, policyTestConfig(t, h, map[string]any{"target": "(global)", "scheduling": manual}))
+	requireProtocolErrorContaining(t, planned.Diagnostics, "Invalid scheduling")
+	requireProtocolErrorContaining(t, planned.Diagnostics, ": scheduling.jitter.")
+	requireProtocolErrorContaining(t, planned.Diagnostics, "`kopia policy set`")
+	// Replacing (global) while creating it would adopt the fields again.
+	for _, d := range planned.Diagnostics {
+		if strings.Contains(d.Detail, "-replace") {
+			t.Errorf("adopting (global) suggests replacing it: %s", d.Detail)
+		}
+	}
+	if got, want := string(fake.lastCall(t, "POST /api/v1/policy/resolve").body), `{"updates":{"scheduling":{"manual":true,"jitter":30},"newFlag":true},"numUpcomingSnapshotTimes":0}`; got != want {
+		t.Errorf("resolve body = %s, want %s", got, want)
+	}
+
+	// Without the field the same section passes.
+	store.putRaw(t, "(global)", `{"scheduling":{"cron":["0 1 * * *"]},"newFlag":true}`)
+	planned = h.plan(t, policyTestType, nil, policyTestConfig(t, h, map[string]any{"target": "(global)", "scheduling": manual}))
+	requireNoProtocolErrors(t, planned.Diagnostics)
+
+	reads := fake.count("GET /api/v1/policy")
+	planned = h.plan(t, policyTestType, nil, policyTestConfig(t, h, map[string]any{"target": "@host1", "scheduling": manual}))
+	requireNoProtocolErrors(t, planned.Diagnostics)
+	if fake.count("GET /api/v1/policy") != reads {
+		t.Error("planning the creation of a policy read the stored one")
+	}
+
+	// An update reads the stored policy.
+	host := policyTestApply(t, h, nil, policyTestConfig(t, h, map[string]any{
+		"target": "@host1", "scheduling": map[string]any{"interval_seconds": 3600},
+	}))
+	store.putRaw(t, "@host1", `{"scheduling":{"intervalSeconds":3600,"jitter":30}}`)
+	planned = h.plan(t, policyTestType, host, policyTestConfig(t, h, map[string]any{"target": "@host1", "scheduling": manual}))
+	requireProtocolErrorContaining(t, planned.Diagnostics, ": scheduling.jitter.")
+	requireProtocolErrorContaining(t, planned.Diagnostics, "`terraform apply -replace` while its configuration is still the one applied")
+
+	// Moving the resource to a target that has a policy plans a create,
+	// which reads nothing: the create refuses the existing policy anyway.
+	store.putRaw(t, "@host2", `{"scheduling":{"jitter":30}}`)
+	reads = fake.count("GET /api/v1/policy")
+	planned = h.plan(t, policyTestType, host, policyTestConfig(t, h, map[string]any{"target": "@host2", "scheduling": manual}))
+	requireNoProtocolErrors(t, planned.Diagnostics)
+	if fake.count("GET /api/v1/policy") != reads {
+		t.Error("planning a new target read its stored policy")
+	}
+
+	// When the stored policy cannot be read, the planned section is checked
+	// on its own; the write reads it again.
+	fake.reply("GET /api/v1/policy", http.StatusOK, "null\n")
+	planned = h.plan(t, policyTestType, host, policyTestConfig(t, h, map[string]any{"target": "@host1", "scheduling": manual}))
+	requireNoProtocolErrors(t, planned.Diagnostics)
+	if got, want := string(fake.lastCall(t, "POST /api/v1/policy/resolve").body), `{"updates":{"scheduling":{"manual":true}},"numUpcomingSnapshotTimes":0}`; got != want {
+		t.Errorf("resolve body without the stored policy = %s, want %s", got, want)
+	}
 }
 
 func TestPolicyResourcePlanChecksAlgorithmNames(t *testing.T) {

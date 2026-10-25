@@ -27,11 +27,12 @@ reports another release, because Kopia's web UI API is internal and unversioned.
 
 ## What it manages
 
-* **Policies** — `kopia_policy`, which owns the whole policy of one target:
-  `(global)`, `@host`, `user@host` or a directory. The `kopia_policies` data
-  source lists the targets that have a policy, and `kopia_effective_policy`
-  resolves what a target inherits, where each value comes from and when its
-  next snapshots are due.
+* **Policies** — `kopia_policy`, which owns the policy of one target:
+  `(global)`, `@host`, `user@host` or a directory, and keeps the settings it
+  has no attribute for, such as those of a later Kopia release. The
+  `kopia_policies` data source lists the targets that have a policy, and
+  `kopia_effective_policy` resolves what a target inherits, where each value
+  comes from and when its next snapshots are due.
 * **Notifications** — `kopia_notification_profile` for email, Pushover and
   webhook profiles, and the `kopia_notification_profiles` data source, which
   lists them without their secrets.

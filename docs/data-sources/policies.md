@@ -59,6 +59,6 @@ Read-Only:
 - `host` (String) Host of the target; null for the global policy.
 - `manifest_id` (String) Identifier of the repository manifest the policy is stored in. Kopia writes a new manifest on every change, so it changes with the policy.
 - `path` (String) Path of the target; null unless it is a path policy.
-- `policy_json` (String) The stored policy as compact JSON with Kopia's own field names, such as `{"retention":{"keepDaily":14}}`, for `jsondecode`. Empty sections are left out, so the text is the same whichever Kopia release answered; so are fields this provider does not know, which a later Kopia release might add.
+- `policy_json` (String) The stored policy as compact JSON with Kopia's own field names, such as `{"retention":{"keepDaily":14}}`, for `jsondecode`. The settings `kopia_policy` has attributes for come first, with empty sections left out, so that they read the same whichever Kopia release answered; any other setting Kopia stores, such as one a later release adds, follows as Kopia reports it, empty values included.
 - `target` (String) Target of the policy as Kopia writes it, such as `(global)`, `@host1`, `docker@host1` or `docker@host1:/data/app`: the `target` of a `kopia_policy`, and its import id.
 - `user_name` (String) User of the target; null for the global policy and host policies.

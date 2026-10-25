@@ -27,13 +27,19 @@ First release. Built and verified against Kopia 0.23.1.
   self-generated certificate by its SHA-256 fingerprint, and warns about Kopia
   releases outside the supported ones and about a server without a connected
   repository.
-- `kopia_policy`, which owns the whole snapshot policy of one target:
-  `(global)`, `@host`, `user@host` or a directory, in the form Kopia writes it,
-  checked by a strict parser. Every section of a Kopia policy is a nested
-  attribute — `retention`, `files`, `error_handling`, `scheduling`,
-  `compression`, `metadata_compression`, `splitter`, `actions`,
-  `os_snapshots`, `logging` and `upload` — plus `no_parent`; whatever is left
-  out is inherited. Creating refuses a target that already has a policy,
+- `kopia_policy`, which owns the snapshot policy of one target: `(global)`,
+  `@host`, `user@host` or a directory, in the form Kopia writes it, checked by
+  a strict parser. Every section of a Kopia policy is a nested attribute —
+  `retention`, `files`, `error_handling`, `scheduling`, `compression`,
+  `metadata_compression`, `splitter`, `actions`, `os_snapshots`, `logging`
+  and `upload` — plus `no_parent`; whatever is left out is inherited.
+  Settings the resource has no attribute for, such as those a later Kopia
+  release adds and a user sets in the Kopia UI, are kept: every create and
+  update reads the stored policy first and replaces only the settings the
+  resource has attributes for, at every level of the policy, and writes
+  nothing when that read fails; the plan-time check of `scheduling` judges
+  the section with them. They are not kept inside an action or a time of day
+  the configuration changes, nor by destroy. Creating refuses a target that already has a policy,
   except `(global)`, which is adopted, and destroying `(global)` resets it to
   the policy a new repository starts with instead of deleting it. At plan time
   the provider checks cron entries with the server and compressor and splitter
@@ -56,7 +62,8 @@ First release. Built and verified against Kopia 0.23.1.
   limits the server started with, the provider then saves the throttle limits
   in effect again. Destroying the resource leaves the description in place.
 - The `kopia_policies` data source, which lists the targets that have a policy,
-  filtered by host, user and path, with each stored policy as JSON.
+  filtered by host, user and path, with each stored policy as JSON, including
+  the settings the provider has no attribute for.
 - The `kopia_effective_policy` data source, which resolves what Kopia applies
   to a target, which target each value comes from, the next snapshot times and
   any scheduling error.

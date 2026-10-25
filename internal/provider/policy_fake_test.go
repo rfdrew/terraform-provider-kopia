@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,8 +19,9 @@ import (
 // and GET /api/v1/repo/algorithms, with what the provider relies on from each
 // (spec: policy.md §2 and §3):
 //
-//   - a policy is stored as the JSON object that was PUT, so a test sees
-//     exactly what the provider sent, and is served back in the shape of the
+//   - a policy is stored as the JSON object that was PUT, numbers exactly as
+//     sent, so a test sees what the provider sent, fields Kopia's Policy does
+//     not have included, and is served back, keys sorted, in the shape of the
 //     release being emulated: 0.22.3 and later send every section, empty or
 //     not, while 0.22.0 leaves empty ones out;
 //   - a missing policy is 400 NOT_FOUND, not 404, and DELETE answers 200
@@ -95,8 +97,8 @@ func (s *policyTestStore) putRaw(t *testing.T, target, body string) {
 		// The odd targets Kopia also holds, such as "docker@".
 		si = policyTestOddTarget(t, target)
 	}
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+	decoded, err := policyTestDecode([]byte(body))
+	if err != nil {
 		t.Fatalf("policy body %s: %v", body, err)
 	}
 	s.mu.Lock()
@@ -184,9 +186,9 @@ func (s *policyTestStore) serveGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *policyTestStore) servePut(w http.ResponseWriter, r *http.Request) {
 	target := policyTestTarget(r)
-	var p map[string]any
 	raw, _ := io.ReadAll(r.Body)
-	if err := json.Unmarshal(raw, &p); err != nil {
+	p, err := policyTestDecode(raw)
+	if err != nil {
 		writeFakeResponse(w, http.StatusBadRequest, fakeErrorBody(kopiaclient.CodeMalformedRequest, "malformed request body"))
 		return
 	}
@@ -292,14 +294,19 @@ func policyTestValidate(target kopiaclient.SourceInfo, p map[string]any) string 
 
 // policyTestSchedulingError is ValidateSchedulingPolicy
 // (scheduling_policy.go:276-290), with "invalid" standing in for whatever
-// cronexpr cannot parse.
+// cronexpr cannot parse. Kopia refuses manual together with any other field
+// of the section that decodes to something, which a null never does.
 func policyTestSchedulingError(p map[string]any) string {
 	scheduling, _ := p["scheduling"].(map[string]any)
 	if scheduling == nil {
 		return ""
 	}
-	if manual, _ := scheduling["manual"].(bool); manual && len(scheduling) > 1 {
-		return "invalid scheduling policy: manual cannot be combined with other scheduling policies"
+	if manual, _ := scheduling["manual"].(bool); manual {
+		for name, value := range scheduling {
+			if name != "manual" && value != nil {
+				return "invalid scheduling policy: manual cannot be combined with other scheduling policies"
+			}
+		}
 	}
 	cron, _ := scheduling["cron"].([]any)
 	for _, entry := range cron {
@@ -324,29 +331,39 @@ func (s *policyTestStore) shape(p map[string]any) map[string]any {
 	if s.compact {
 		return shaped
 	}
-	for _, section := range []string{"retention", "files", "errorHandling", "scheduling", "compression",
-		"metadataCompression", "splitter", "actions", "osSnapshots", "logging", "upload"} {
-		if _, ok := shaped[section]; !ok {
-			shaped[section] = map[string]any{}
-		}
+	policyTestEnsure(shaped, "retention", "files", "errorHandling", "scheduling", "compression",
+		"metadataCompression", "splitter", "actions", "osSnapshots", "logging", "upload")
+	if osSnapshots, ok := shaped["osSnapshots"].(map[string]any); ok {
+		policyTestEnsure(osSnapshots, "volumeShadowCopy")
 	}
-	policyTestEnsure(shaped["osSnapshots"].(map[string]any), "volumeShadowCopy")
-	policyTestEnsure(shaped["logging"].(map[string]any), "directories", "entries")
+	if logging, ok := shaped["logging"].(map[string]any); ok {
+		policyTestEnsure(logging, "directories", "entries")
+	}
 	return shaped
 }
 
+// policyTestEnsure adds each of names that section lacks, or holds null for,
+// as {}: Kopia decodes null into a struct as nothing, and sends the struct.
 func policyTestEnsure(section map[string]any, names ...string) {
 	for _, name := range names {
-		if _, ok := section[name]; !ok {
+		if section[name] == nil {
 			section[name] = map[string]any{}
 		}
 	}
 }
 
+// policyTestDecode decodes a JSON object with its numbers as written.
+func policyTestDecode(data []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var decoded map[string]any
+	err := decoder.Decode(&decoded)
+	return decoded, err
+}
+
 // policyTestCopy deep-copies a decoded JSON object.
 func policyTestCopy(p map[string]any) map[string]any {
 	encoded, _ := json.Marshal(p)
-	var copied map[string]any
-	_ = json.Unmarshal(encoded, &copied)
+	copied, _ := policyTestDecode(encoded)
 	return copied
 }

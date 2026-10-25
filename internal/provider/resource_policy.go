@@ -2,11 +2,13 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -32,10 +34,16 @@ var (
 )
 
 // NewPolicyResource returns the kopia_policy resource.
-func NewPolicyResource() resource.Resource { return &policyResource{} }
+func NewPolicyResource() resource.Resource {
+	return &policyResource{storedReadDelays: []time.Duration{time.Second, 2 * time.Second}}
+}
 
 type policyResource struct {
 	client *kopiaclient.Client
+	// storedReadDelays are the pauses before reading the stored policy again
+	// ahead of a write, when Kopia answers null instead of it; there is one
+	// more read than pauses.
+	storedReadDelays []time.Duration
 }
 
 type policyResourceModel struct {
@@ -49,8 +57,8 @@ func (r *policyResource) Metadata(_ context.Context, req resource.MetadataReques
 }
 
 // The policy's attributes are optional and not computed: the resource owns
-// the whole policy of its target, as Kopia's PUT replaces it as a whole, and
-// an attribute left out is not set by this policy, so it is inherited.
+// every setting of its target's policy that it has an attribute for, and an
+// attribute left out is not set by this policy, so it is inherited.
 func (r *policyResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	attributes := policyResourceAttributes(policyBodyAttributes())
 	attributes["id"] = schema.StringAttribute{
@@ -78,16 +86,26 @@ func (r *policyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages the snapshot policy of one target on a Kopia server: the global policy, " +
 			"the policy of a host, of a user on a host, or of a directory of a user on a host.\n\n" +
-			"The resource owns the whole policy of its target. Kopia replaces a policy as a whole on every " +
-			"write, so every apply stores exactly what the configuration says, and whatever is set outside " +
-			"Terraform — in the Kopia UI, with `kopia policy set` or by another tool — shows up as a difference " +
-			"on the next plan and is overwritten by the next apply. An attribute that is left out, or `null`, " +
-			"is not set by this policy and is inherited: from the policies of the parent directories, then " +
-			"`user@host`, then `@host`, then `(global)`, and finally from Kopia's built-in defaults. The " +
-			"`kopia_effective_policy` data source shows the outcome.\n\n" +
-			"At plan time the provider asks Kopia whether it accepts the `scheduling` section, which is how " +
-			"an invalid cron entry is found before the apply, and checks compressor and splitter names " +
-			"against those the server supports.\n\n" +
+			"The resource owns every setting of its target's policy that it has an attribute for, which with " +
+			"Kopia 0.22 and 0.23 is every setting there is: every apply stores exactly what the configuration " +
+			"says for them, and whatever is set outside Terraform — in the Kopia UI, with `kopia policy set` or " +
+			"by another tool — shows up as a difference on the next plan and is overwritten by the next apply. " +
+			"An attribute that is left out, or `null`, is not set by this policy and is inherited: from the " +
+			"policies of the parent directories, then `user@host`, then `@host`, then `(global)`, and finally " +
+			"from Kopia's built-in defaults. The `kopia_effective_policy` data source shows the outcome.\n\n" +
+			"At plan time the provider asks Kopia whether it accepts the `scheduling` section as the apply " +
+			"would write it, which is how an invalid cron entry is found before the apply, and checks " +
+			"compressor and splitter names against those the server supports.\n\n" +
+			"~> **Settings without an attribute.** A setting a later Kopia release adds, which the provider " +
+			"has no attribute for yet, is kept as Kopia stores it, at any level of the policy: Kopia replaces a " +
+			"policy as a whole on every write, so the provider reads the stored policy right before each write " +
+			"and changes only the settings it has attributes for, and writes nothing if that read fails. Such " +
+			"a setting never shows up in a plan, and Terraform has no way to set it: change or remove it in the " +
+			"Kopia UI or with `kopia policy set`, or drop it by replacing the resource with `terraform apply " +
+			"-replace`. It is not kept inside an " +
+			"action the configuration removes or gives another command, inside a time of day the configuration " +
+			"changes, or when the resource is destroyed. Only settings the Kopia server's own release knows can " +
+			"be kept: Kopia drops the others on every write, the Kopia UI's included.\n\n" +
 			"~> **`false`, `0` and empty values.** Most of Kopia's settings can be left unset apart from " +
 			"`false` or `0`, and for those an explicit `false` or `0` overrides what is inherited. Some cannot, " +
 			"and the attribute descriptions say which: the `no_parent*` flags and `scheduling.manual` cannot " +
@@ -199,7 +217,13 @@ func (r *policyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 	if unchanged {
 		return
 	}
-	r.checkScheduling(ctx, si, plan.policyBodyModel, &resp.Diagnostics)
+	// Changing the target replaces the resource, so the plan creates one.
+	var priorTarget types.String
+	if !req.State.Raw.IsNull() {
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("target"), &priorTarget)...)
+	}
+	creating := req.State.Raw.IsNull() || priorTarget.ValueString() != target.ValueString()
+	r.checkScheduling(ctx, si, plan.policyBodyModel, creating, &resp.Diagnostics)
 }
 
 // policyAlgorithmUse is a compressor or splitter name a policy sets.
@@ -336,11 +360,29 @@ func (r *policyResource) checkAlgorithms(ctx context.Context, m policyBodyModel,
 // rest of the response is not used; for (global) and @host targets it is even
 // wrong (spec: policy.md §3.6), and upcoming snapshot times change with the
 // clock, so they are not planned.
-func (r *policyResource) checkScheduling(ctx context.Context, target kopiaclient.SourceInfo, m policyBodyModel, diags *diag.Diagnostics) {
+//
+// The updates are the body the write would send: the planned policy over the
+// stored one, whose scheduling fields the resource has no attribute for are
+// kept, and judged by Kopia along with the rest. A policy being created has
+// none, except (global), which is adopted; when (global) is replaced, its
+// reset drops them before the create, which the plan cannot tell apart. When
+// the stored policy cannot be read, the planned policy is checked on its own;
+// the write reads it again.
+func (r *policyResource) checkScheduling(ctx context.Context, target kopiaclient.SourceInfo, m policyBodyModel, creating bool, diags *diag.Diagnostics) {
 	if m.Scheduling.IsNull() {
 		return
 	}
-	resolved, err := r.client.ResolvePolicy(ctx, target, m.toWire(), 0)
+	var stored json.RawMessage
+	if !creating || target.IsGlobal() {
+		var err error
+		if stored, err = r.client.GetPolicyJSON(ctx, target); err != nil {
+			tflog.Debug(ctx, "Checking the scheduling without the stored policy, which could not be read",
+				map[string]any{"target": target.String(), "error": err.Error()})
+			stored = nil
+		}
+	}
+	policy := m.toWire()
+	resolved, err := r.client.ResolvePolicyKeepingUnknown(ctx, target, policy, stored, 0)
 	if err != nil {
 		diags.AddWarning(
 			"Unable to check the scheduling with Kopia",
@@ -353,7 +395,8 @@ func (r *policyResource) checkScheduling(ctx context.Context, target kopiaclient
 		diags.AddAttributeError(
 			path.Root("scheduling"),
 			"Invalid scheduling",
-			"Kopia refuses this scheduling section: "+resolved.SchedulingError+".",
+			"Kopia refuses this scheduling section: "+resolved.SchedulingError+"."+
+				policyKeptFieldsDetail(kopiaclient.KeptPolicyFields(stored, policy), "scheduling.", creating),
 		)
 	}
 }
@@ -418,19 +461,26 @@ func (r *policyResource) Create(ctx context.Context, req resource.CreateRequest,
 	defer unlock()
 
 	// The global policy always exists — `kopia repository create` writes it —
-	// so it is adopted. Any other existing policy belongs to someone else: the
+	// so it is adopted, keeping what it stores that the resource has no
+	// attribute for. Any other existing policy belongs to someone else: the
 	// Kopia UI, kopia-docker-watcher, another configuration. A PUT would
 	// replace it without a trace, so it has to be imported deliberately.
-	if !target.IsGlobal() {
-		_, err := r.client.GetPolicy(ctx, target)
+	var stored json.RawMessage
+	if target.IsGlobal() {
+		var ok bool
+		if stored, ok = r.storedPolicy(ctx, target, "Unable to create Kopia policy", &resp.Diagnostics); !ok {
+			return
+		}
+	} else {
+		_, err := r.readStored(ctx, target)
 		switch {
 		case err == nil:
 			resp.Diagnostics.AddAttributeError(
 				path.Root("target"),
 				"Kopia policy already exists",
-				"The Kopia server already has a policy for "+target.String()+". kopia_policy owns the whole "+
-					"policy of its target and replaces it on every apply, so it does not take over an "+
-					"existing one unasked: it may have been set up in the Kopia UI, by kopia-docker-watcher "+
+				"The Kopia server already has a policy for "+target.String()+". kopia_policy owns the "+
+					"settings of its target's policy and replaces them on every apply, so it does not take over "+
+					"an existing one unasked: it may have been set up in the Kopia UI, by kopia-docker-watcher "+
 					"or by another configuration. To manage it with Terraform, import it with an import "+
 					"block or `terraform import`, using "+strconv.Quote(target.String())+" as the id; or "+
 					"delete it first.",
@@ -447,12 +497,52 @@ func (r *policyResource) Create(ctx context.Context, req resource.CreateRequest,
 		}
 	}
 
-	if err := r.client.SetPolicy(ctx, target, plan.toWire()); err != nil {
-		addPolicyWriteError(&resp.Diagnostics, "Unable to create Kopia policy", target, err)
+	policy := plan.toWire()
+	if err := r.client.SetPolicyKeepingUnknown(ctx, target, policy, stored); err != nil {
+		addPolicyWriteError(&resp.Diagnostics, "Unable to create Kopia policy", target, err,
+			kopiaclient.KeptPolicyFields(stored, policy), true)
 		return
 	}
 	r.readBack(ctx, target, plan, &resp.State, &resp.Diagnostics)
 	setIdentity(ctx, resp.Identity, "target", target.String(), &resp.Diagnostics)
+}
+
+// storedPolicy reads the policy target stores before a write, which keeps
+// whatever of it the resource has no attribute for, such as a setting a later
+// Kopia release added; nil when the target has none. When reading fails, it
+// reports that nothing was written, as writing anyway would erase those
+// settings.
+func (r *policyResource) storedPolicy(ctx context.Context, target kopiaclient.SourceInfo, summary string, diags *diag.Diagnostics) (json.RawMessage, bool) {
+	stored, err := r.readStored(ctx, target)
+	switch {
+	case err == nil:
+		return stored, true
+	case kopiaclient.IsNotFound(err):
+		return nil, true
+	}
+	diags.AddError(summary, "Reading the policy of "+target.String()+" failed, so none was written: every write "+
+		"starts from the stored policy, so that the settings kopia_policy has no attribute for are kept. "+
+		policyReadErrorDetail(err))
+	return nil, false
+}
+
+// readStored reads the policy target stores ahead of a write. Kopia answers
+// null when loading the policy fails for a moment, which would stop the
+// write, so it is read again after each of r.storedReadDelays.
+func (r *policyResource) readStored(ctx context.Context, target kopiaclient.SourceInfo) (json.RawMessage, error) {
+	for attempt := 0; ; attempt++ {
+		stored, err := r.client.GetPolicyJSON(ctx, target)
+		if !errors.Is(err, kopiaclient.ErrPolicyUnavailable) || attempt == len(r.storedReadDelays) {
+			return stored, err
+		}
+		tflog.Debug(ctx, "Kopia answered null for the policy; reading it again",
+			map[string]any{"target": target.String(), "attempt": attempt + 1})
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(r.storedReadDelays[attempt]):
+		}
+	}
 }
 
 // readBack records what Kopia stored for target after a write. Kopia stores a
@@ -508,9 +598,10 @@ func (r *policyResource) Read(ctx context.Context, req resource.ReadRequest, res
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Update writes the whole planned policy. Kopia's PUT creates a policy that
-// was deleted outside of Terraform since the last refresh, which is what the
-// plan asks for anyway.
+// Update writes the whole planned policy over the stored one, keeping what the
+// resource has no attribute for. Kopia's PUT creates a policy that was
+// deleted outside of Terraform since the last refresh, which is what the plan
+// asks for anyway.
 func (r *policyResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan policyResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -525,8 +616,14 @@ func (r *policyResource) Update(ctx context.Context, req resource.UpdateRequest,
 	unlock := policyLockTarget(r.client, target)
 	defer unlock()
 
-	if err := r.client.SetPolicy(ctx, target, plan.toWire()); err != nil {
-		addPolicyWriteError(&resp.Diagnostics, "Unable to update Kopia policy", target, err)
+	stored, ok := r.storedPolicy(ctx, target, "Unable to update Kopia policy", &resp.Diagnostics)
+	if !ok {
+		return
+	}
+	policy := plan.toWire()
+	if err := r.client.SetPolicyKeepingUnknown(ctx, target, policy, stored); err != nil {
+		addPolicyWriteError(&resp.Diagnostics, "Unable to update Kopia policy", target, err,
+			kopiaclient.KeptPolicyFields(stored, policy), false)
 		return
 	}
 	r.readBack(ctx, target, plan, &resp.State, &resp.Diagnostics)
@@ -612,8 +709,10 @@ func policyWriteErrorDetail(err error) string {
 // addPolicyWriteError reports a failed PUT. Kopia reports a policy it refuses
 // as 500 INTERNAL, like a storage failure, so the message is what tells them
 // apart (spec: policy.md §2.2), and a refusal is pinned to the attribute it is
-// about.
-func addPolicyWriteError(diags *diag.Diagnostics, summary string, target kopiaclient.SourceInfo, err error) {
+// about. kept are the fields the write kept although the resource has no
+// attribute for them, which Kopia may have refused too; creating says that
+// the write created the resource.
+func addPolicyWriteError(diags *diag.Diagnostics, summary string, target kopiaclient.SourceInfo, err error, kept []string, creating bool) {
 	detail := "Kopia did not store the policy of " + target.String() + ". " + policyWriteErrorDetail(err)
 	var apiErr *kopiaclient.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != kopiaclient.CodeInternal {
@@ -622,12 +721,40 @@ func addPolicyWriteError(diags *diag.Diagnostics, summary string, target kopiacl
 	}
 	switch {
 	case strings.Contains(apiErr.Message, "invalid scheduling policy"):
-		diags.AddAttributeError(path.Root("scheduling"), summary, detail)
+		diags.AddAttributeError(path.Root("scheduling"), summary, detail+policyKeptFieldsDetail(kept, "scheduling.", creating))
 	case strings.Contains(apiErr.Message, "invalid upload policy"):
-		diags.AddAttributeError(path.Root("upload").AtName("max_parallel_snapshots"), summary, detail)
+		diags.AddAttributeError(path.Root("upload").AtName("max_parallel_snapshots"), summary,
+			detail+policyKeptFieldsDetail(kept, "upload.", creating))
 	case strings.Contains(apiErr.Message, "invalid policy path"):
 		diags.AddAttributeError(path.Root("target"), summary, detail)
 	default:
-		diags.AddError(summary, detail)
+		diags.AddError(summary, detail+policyKeptFieldsDetail(kept, "", creating))
 	}
+}
+
+// policyKeptFieldsDetail names the fields of kept under prefix, fields a write
+// keeps although the resource has no attribute for them, for an error Kopia
+// may have raised because of them, and how to get rid of them; "" when there
+// are none. Replacing the resource drops them, but not while creating it:
+// (global) is adopted with them again. Nor with a configuration Kopia refuses
+// with them, as the first plan of a replacement checks it against the stored
+// policy, so the replacement has to come before the change.
+func policyKeptFieldsDetail(kept []string, prefix string, creating bool) string {
+	var named []string
+	for _, field := range kept {
+		if strings.HasPrefix(field, prefix) {
+			named = append(named, field)
+		}
+	}
+	if len(named) == 0 {
+		return ""
+	}
+	detail := " The stored policy also has settings kopia_policy has no attribute for, which a write keeps as " +
+		"they are: " + strings.Join(named, ", ") + ". If Kopia refuses the policy because of them, change or " +
+		"remove them in the Kopia UI or with `kopia policy set`"
+	if !creating {
+		detail += ", or drop them by replacing the resource with `terraform apply -replace` while its " +
+			"configuration is still the one applied, and make this change afterwards"
+	}
+	return detail + "."
 }

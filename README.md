@@ -40,7 +40,7 @@ out too, as data rather than configuration; the `kopia_snapshots` and
 
 | Resource | Lifecycle | Notes |
 | --- | --- | --- |
-| `kopia_policy` | create, read, update, delete | Owns the whole policy of one target: `(global)`, `@host`, `user@host` or a directory. Creating refuses a target that already has a policy, except `(global)`, which is adopted and reset to Kopia's defaults on destroy. Cron entries and algorithm names are checked with the server at plan time. Identity `target`; import by target |
+| `kopia_policy` | create, read, update, delete | Owns the policy of one target: `(global)`, `@host`, `user@host` or a directory, and keeps the settings it has no attribute for, such as those of a later Kopia release. Creating refuses a target that already has a policy, except `(global)`, which is adopted and reset to Kopia's defaults on destroy. Cron entries and algorithm names are checked with the server at plan time. Identity `target`; import by target |
 | `kopia_notification_profile` | create, read, update, delete | Email, Pushover or webhook, switchable in place. Creating refuses a name that exists. Secrets are in state; `send_test_on_apply` sends Kopia's test notification. Identity `name`; import by name |
 | `kopia_throttle` | create, read, update (singleton); destroy saves "unlimited" | Owns all seven limits of the server's repository connection; saved in the server's config file. Import id `throttle` |
 | `kopia_repository_description` | create, read, update (singleton); destroy leaves it | Saved in the server's config file, after which the provider saves the throttle limits again. Import id `description` |
