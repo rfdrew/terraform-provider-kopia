@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/action"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -27,7 +29,11 @@ import (
 )
 
 // Ensure the implementation satisfies the framework interfaces.
-var _ provider.Provider = &kopiaProvider{}
+var (
+	_ provider.Provider                  = &kopiaProvider{}
+	_ provider.ProviderWithActions       = &kopiaProvider{}
+	_ provider.ProviderWithListResources = &kopiaProvider{}
+)
 
 // Address is the provider's source address in the Terraform Registry.
 const Address = "registry.terraform.io/rfdrew/kopia"
@@ -462,6 +468,24 @@ func (p *kopiaProvider) DataSources(_ context.Context) []func() datasource.DataS
 		NewAlgorithmsDataSource,
 		NewSourcesDataSource,
 		NewSnapshotsDataSource,
+	}
+}
+
+// ListResources returns the list resources, which answer `terraform query`.
+// Each one shares its type name with the resource whose objects it lists.
+func (p *kopiaProvider) ListResources(_ context.Context) []func() list.ListResource {
+	return []func() list.ListResource{
+		NewPolicyListResource,
+		NewNotificationProfileListResource,
+	}
+}
+
+// Actions returns the actions: one-off operations, invoked by a lifecycle
+// trigger or `terraform apply -invoke`, that keep no state.
+func (p *kopiaProvider) Actions(_ context.Context) []func() action.Action {
+	return []func() action.Action{
+		NewNotificationTestAction,
+		NewSnapshotNowAction,
 	}
 }
 

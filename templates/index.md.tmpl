@@ -24,6 +24,7 @@ reports another release, because Kopia's web UI API is internal and unversioned.
 | Feature | Needs |
 | --- | --- |
 | Import by resource identity (`kopia_policy`, `kopia_notification_profile`) | Terraform 1.12 |
+| The list resources for `terraform query` (`kopia_policy`, `kopia_notification_profile`); the `kopia_notification_test` and `kopia_snapshot_now` actions | Terraform 1.14 |
 
 ## What it manages
 
@@ -32,10 +33,18 @@ reports another release, because Kopia's web UI API is internal and unversioned.
   has no attribute for, such as those of a later Kopia release. The
   `kopia_policies` data source lists the targets that have a policy, and
   `kopia_effective_policy` resolves what a target inherits, where each value
-  comes from and when its next snapshots are due.
+  comes from and when its next snapshots are due. The `kopia_policy` list
+  resource finds the policies to import with `terraform query`.
 * **Notifications** — `kopia_notification_profile` for email, Pushover and
   webhook profiles, and the `kopia_notification_profiles` data source, which
-  lists them without their secrets.
+  lists them without their secrets. The `kopia_notification_profile` list
+  resource finds the profiles to import with `terraform query`, and the
+  `kopia_notification_test` action has Kopia send its test notification
+  through a profile.
+* **Snapshots on demand** — the `kopia_snapshot_now` action asks the server
+  for a snapshot of one source now, as the Kopia UI's **Snapshot now** button
+  does, for instance right after a `kopia_policy` for a new path is created.
+  Kopia only queues the snapshot, so the action does not wait for it.
 * **Server settings** — `kopia_throttle`, the server's storage and bandwidth
   limits, and `kopia_repository_description`, the name the Kopia UI shows for
   the repository.
@@ -101,6 +110,7 @@ are:
 | Notification secrets are returned on every read | SMTP passwords, Pushover tokens and webhook URLs and headers are kept in state, marked sensitive |
 | The throttle limits cannot be removed, only set to unlimited | Destroying `kopia_throttle` saves "unlimited"; limits from the storage configuration do not come back |
 | The repository description can be set but not removed | Destroying `kopia_repository_description` leaves it in place |
+| Kopia reads a missing host, user or path in a snapshot request as "any", and only queues the snapshot | `kopia_snapshot_now` takes exactly one `user@host:path`, of the server's own host, and does not wait for the snapshot |
 
 ## Authentication
 

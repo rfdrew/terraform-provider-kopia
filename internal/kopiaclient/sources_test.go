@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -356,5 +357,95 @@ func TestListSnapshotsRequiresAHost(t *testing.T) {
 	}
 	if len(fake.routes()) != 0 {
 		t.Errorf("calls = %v, want none", fake.routes())
+	}
+}
+
+// sourcesUploadReleaseJSON is POST /api/v1/sources/upload from Kopia 0.23.1:
+// serverapi.MultipleSourceActionResponse, indented as the releases write it.
+const sourcesUploadReleaseJSON = `{
+  "sources": {
+    "root@kopia:/data/app": {
+      "success": true
+    }
+  }
+}
+`
+
+// The source travels as host, userName and path, the user parameter in
+// camelCase, and the answer names the source Kopia queued a snapshot of.
+func TestStartSnapshotSendsTheWholeSource(t *testing.T) {
+	fake := newFakeKopia()
+	fake.reply("POST /api/v1/sources/upload", http.StatusOK, sourcesUploadReleaseJSON)
+
+	queued, err := fake.client(t).StartSnapshot(context.Background(), SourceInfo{Host: "kopia", UserName: "root", Path: "/data/app"})
+	if err != nil {
+		t.Fatalf("StartSnapshot() error = %v", err)
+	}
+	if got := fake.query(t, "POST /api/v1/sources/upload").Encode(); got != "host=kopia&path=%2Fdata%2Fapp&userName=root" {
+		t.Errorf("query = %s", got)
+	}
+	if len(queued) != 1 || !queued["root@kopia:/data/app"] {
+		t.Errorf("StartSnapshot() = %v, want root@kopia:/data/app queued", queued)
+	}
+	if body := fake.lastCall(t, "POST /api/v1/sources/upload").body; len(body) != 0 {
+		t.Errorf("body = %s, want none: kopia reads the source from the query", body)
+	}
+}
+
+// Kopia matches an empty filter against every source, so a source that lacks
+// a host, a user or a path would start a snapshot of each one; nothing is
+// sent for it.
+func TestStartSnapshotRefusesAnIncompleteSource(t *testing.T) {
+	for _, source := range []SourceInfo{
+		{},
+		{Host: "kopia"},
+		{Host: "kopia", UserName: "root"},
+		{Host: "kopia", Path: "/data/app"},
+		{UserName: "root", Path: "/data/app"},
+	} {
+		fake := newFakeKopia()
+		_, err := fake.client(t).StartSnapshot(context.Background(), source)
+		if !errors.Is(err, ErrIncompleteSnapshotSource) {
+			t.Errorf("StartSnapshot(%s) error = %v, want ErrIncompleteSnapshotSource", source, err)
+		}
+		if len(fake.routes()) != 0 {
+			t.Errorf("StartSnapshot(%s) made calls %v, want none", source, fake.routes())
+		}
+	}
+}
+
+// A source the server does not snapshot itself, or does not know at all, is
+// a 404 NOT_FOUND that IsNotFound recognises.
+func TestStartSnapshotOfAnUnknownSource(t *testing.T) {
+	fake := newFakeKopia()
+	fake.replyError("POST /api/v1/sources/upload", http.StatusNotFound, CodeNotFound, "no source matching the provided filters")
+
+	_, err := fake.client(t).StartSnapshot(context.Background(), SourceInfo{Host: "other", UserName: "root", Path: "/data/app"})
+	if !IsNotFound(err) {
+		t.Fatalf("StartSnapshot() error = %v, want NOT_FOUND", err)
+	}
+	if !strings.Contains(err.Error(), "no source matching the provided filters") {
+		t.Errorf("error = %v, want Kopia's message", err)
+	}
+}
+
+// Kopia answers 404 when nothing matched, so a success that names no source
+// is not taken for one.
+func TestStartSnapshotWithoutQueuedSources(t *testing.T) {
+	fake := newFakeKopia()
+	fake.reply("POST /api/v1/sources/upload", http.StatusOK, `{"sources":{}}`+"\n")
+
+	if _, err := fake.client(t).StartSnapshot(context.Background(), SourceInfo{Host: "kopia", UserName: "root", Path: "/data/app"}); err == nil ||
+		!strings.Contains(err.Error(), "without naming a source") {
+		t.Fatalf("StartSnapshot() error = %v, want one about the empty answer", err)
+	}
+}
+
+func TestStartSnapshotNeedsARepository(t *testing.T) {
+	fake := newFakeKopia()
+	fake.replyError("POST /api/v1/sources/upload", http.StatusBadRequest, CodeNotConnected, "not connected")
+
+	if _, err := fake.client(t).StartSnapshot(context.Background(), SourceInfo{Host: "kopia", UserName: "root", Path: "/data/app"}); !IsNotConnected(err) {
+		t.Fatalf("StartSnapshot() error = %v, want NOT_CONNECTED", err)
 	}
 }
