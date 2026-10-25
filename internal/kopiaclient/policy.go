@@ -576,7 +576,7 @@ func (c *Client) ListPolicies(ctx context.Context, filter PolicyFilter) ([]Polic
 	var resp struct {
 		Policies []PolicyEntry `json:"policies"`
 	}
-	query := SourceInfo{Host: filter.Host, UserName: filter.UserName, Path: filter.Path}.query()
+	query := SourceInfo(filter).query()
 	if err := c.do(ctx, http.MethodGet, "/api/v1/policies", query, nil, &resp); err != nil {
 		return nil, err
 	}

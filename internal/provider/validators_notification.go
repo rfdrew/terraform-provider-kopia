@@ -169,12 +169,23 @@ func isNotificationHeaderName(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if r > unicode.MaxASCII || !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			strings.ContainsRune("!#$%&'*+-.^_`|~", r)) {
+		if !isNotificationTokenChar(r) {
 			return false
 		}
 	}
 	return true
+}
+
+// isNotificationTokenChar reports whether r is a tchar of RFC 9110 §5.6.2: an
+// ASCII letter or digit, or one of the listed symbols. Every case is ASCII, so
+// anything beyond ASCII is refused too.
+func isNotificationTokenChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	default:
+		return strings.ContainsRune("!#$%&'*+-.^_`|~", r)
+	}
 }
 
 // isNotificationHeaderValue reports whether a header value survives Kopia's
