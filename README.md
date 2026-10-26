@@ -9,13 +9,13 @@ notification or take a snapshot now.
 
 ## Versions
 
-**Provider 0.1.0 (unreleased) — built and verified against Kopia 0.23.1.**
+**Provider 0.1.0 — built and verified against Kopia 0.23.1.**
 The 0.22 and 0.23 releases are supported; the provider warns when the server
 reports another release.
 
 | Provider | Released | Verified against | Supported Kopia | Terraform | OpenTofu |
 | --- | --- | --- | --- | --- | --- |
-| 0.1.0 | Unreleased | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
+| 0.1.0 | 2026-10-26 | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
 
 Terraform 1.9 is enough for everything except importing by resource identity,
 which needs Terraform 1.12 or newer, and the list resources and actions, which

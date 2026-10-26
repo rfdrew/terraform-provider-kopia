@@ -6,7 +6,7 @@ All notable changes to this provider are recorded here. The format follows
 at 0.x, a minor release may change behaviour; such changes are listed under
 **Breaking and behaviour changes**.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-26
 
 First release. Built and verified against Kopia 0.23.1.
 

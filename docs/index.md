@@ -13,13 +13,13 @@ description — through the HTTP API behind its web UI, the one
 
 ## Compatibility
 
-**Provider 0.1.0** (unreleased) is built and verified against **Kopia 0.23.1**.
+**Provider 0.1.0** is built and verified against **Kopia 0.23.1**.
 The 0.22 and 0.23 releases are supported; the provider warns when the server
 reports another release, because Kopia's web UI API is internal and unversioned.
 
 | Provider | Verified against | Supported Kopia | Terraform | OpenTofu |
 | --- | --- | --- | --- | --- |
-| 0.1.0 (unreleased) | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
+| 0.1.0 | Kopia 0.23.1 | 0.22.x, 0.23.x | 1.9+ | 1.9+ |
 
 | Feature | Needs |
 | --- | --- |
